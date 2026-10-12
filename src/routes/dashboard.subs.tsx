@@ -6,11 +6,11 @@ import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 import { useSubscription, formatCountdown } from "@/lib/use-subscription";
 import { getEthQuote, createEthOrder, checkEthPayment, checkWalletBalance } from "@/lib/payments.functions";
-import { Clock, Check, Loader2, Sparkles, ArrowUp, Sun, Copy, ExternalLink, AlertTriangle } from "lucide-react";
+import { Clock, Check, Loader2, Sparkles, ArrowUp, Snowflake, Copy, ExternalLink, AlertTriangle } from "lucide-react";
 
 export const Route = createFileRoute("/dashboard/subs")({ component: SubsPage });
 
-const BONUS = 1.0; // no bonus currently
+const WINTER_BONUS = 1.2; // 1.2x winter sale
 const PLANS: { id: string; label: string; eur: number; days: number; popular?: boolean; best?: boolean }[] = [
   { id: "3days", label: "3 Days", eur: 10, days: 3 },
   { id: "30days", label: "30 Days", eur: 20, days: 30, popular: true },
@@ -34,6 +34,7 @@ function SubsPage() {
   const { user } = useAuth();
   const sub = useSubscription(user?.id);
   const [payEnabled, setPayEnabled] = useState(true);
+  const [winterSale, setWinterSale] = useState<{ enabled: boolean; multiplier: number }>({ enabled: true, multiplier: 1.2 });
   const [payMode, setPayMode] = useState<"live" | "sandbox">("live");
 
   // Modal state
@@ -54,12 +55,19 @@ function SubsPage() {
   const checkBal = useServerFn(checkWalletBalance);
 
   useEffect(() => {
-    supabase.from("app_settings").select("value").eq("key", "payments").maybeSingle()
+    supabase.from("app_settings").select("key,value").in("key", ["payments", "winter_sale"])
       .then(({ data }) => {
-        const v = (data?.value ?? {}) as { enabled?: boolean; mode?: "live" | "sandbox" };
-        setPayEnabled(v.enabled !== false);
-        setPayMode(v.mode === "sandbox" ? "sandbox" : "live");
-      });
+        for (const row of data ?? []) {
+          if (row.key === "payments") {
+            const v = (row.value ?? {}) as { enabled?: boolean; mode?: "live" | "sandbox" };
+            setPayEnabled(v.enabled !== false);
+            setPayMode(v.mode === "sandbox" ? "sandbox" : "live");
+          }
+          if (row.key === "winter_sale") {
+            const v = (row.value ?? {}) as { enabled?: boolean; multiplier?: number };
+            setWinterSale({ enabled: v.enabled !== false, multiplier: v.multiplier ?? 1.2 });
+          }
+        }
   }, []);
 
   const loadPending = useCallback(async () => {
