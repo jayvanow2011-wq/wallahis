@@ -20,11 +20,6 @@ const STEP_LABEL: Record<Step, string> = {
   acc: "Account", creating: "Account", twofa: "Two-factor", recovery: "Recovery", profile: "Profile", done: "Done",
 };
 
-const PLANS = [
-  { id: "trial", name: "Trial", price: "Free", desc: "3-day free trial, auto-activated" },
-  { id: "1month", name: "Pro", price: "$15/mo", desc: "Monthly access, cancel anytime" },
-  { id: "lifetime", name: "Lifetime", price: "$200", desc: "One-time, forever" },
-];
 
 function SignupPage() {
   const navigate = useNavigate();
@@ -51,7 +46,6 @@ function SignupPage() {
   const [bio, setBio] = useState("");
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
   const [socials, setSocials] = useState({ discord: "", telegram: "", twitter: "", website: "" });
-  const [plan, setPlan] = useState("trial");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -123,7 +117,7 @@ function SignupPage() {
         socials,
       }});
       setStep("done");
-      setTimeout(() => navigate({ to: plan !== "trial" ? "/dashboard/subs" : "/dashboard" }), 900);
+      setTimeout(() => navigate({ to: "/dashboard/subs" }), 900);
     } finally { setBusy(false); }
   };
 
@@ -311,22 +305,6 @@ function SignupPage() {
                         className="input text-xs" placeholder={k === "website" ? "https://…" : "@handle"} />
                     </Field>
                   ))}
-                </div>
-                <div>
-                  <div className="mb-2 text-[12px] font-medium text-muted-foreground">Pick a plan</div>
-                  <div className="grid gap-2">
-                    {PLANS.map((p) => (
-                      <button key={p.id} type="button" onClick={() => setPlan(p.id)}
-                        className={`flex items-center justify-between rounded-lg border px-3 py-2.5 text-left transition
-                          ${plan === p.id ? "border-foreground bg-secondary" : "border-border hover:border-foreground/40"}`}>
-                        <div>
-                          <div className="text-sm font-medium">{p.name}</div>
-                          <div className="text-[11px] text-muted-foreground">{p.desc}</div>
-                        </div>
-                        <div className="text-sm font-semibold">{p.price}</div>
-                      </button>
-                    ))}
-                  </div>
                 </div>
                 {!twofaEnabled && (
                   <div className="rounded-md border border-border bg-secondary/50 px-3 py-2 text-[11px] text-muted-foreground">
