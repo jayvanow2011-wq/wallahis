@@ -1,0 +1,23 @@
+# Caddy reverse proxy — fronts the Node WS server with auto-TLS.
+# Put on the box that owns umad.servemc.net (DNS A → that IP).
+#
+#   sudo caddy run --config /etc/caddy/Caddyfile
+#
+umad.servemc.net {
+    encode zstd gzip
+
+    # WebSocket upgrade — pass through to the relay.
+    @ws {
+        header Connection *Upgrade*
+        header Upgrade    websocket
+    }
+    reverse_proxy @ws localhost:24578
+
+    # All other HTTP traffic (/, /health, /stats).
+    reverse_proxy localhost:24578 {
+        header_up Host {host}
+        header_up X-Real-IP {remote}
+        header_up X-Forwarded-For {remote}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}
