@@ -44,7 +44,7 @@ function ReferPage() {
     })();
   }, [user]);
 
-  const link = code ? `${window.location.origin}/?ref=${code}` : "";
+  const link = code ? `${window.location.origin}/signup?ref=${code}` : "";
   const activated = referrals.filter((r) => r.activated_at).length;
   const totalDays = referrals.reduce((acc, r) => acc + r.bonus_days_awarded, 0);
   const milestoneBonus = Math.floor(activated / 5) * 30;
