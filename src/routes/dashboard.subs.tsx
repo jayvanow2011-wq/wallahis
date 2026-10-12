@@ -232,6 +232,7 @@ function SubsPage() {
           </div>
         </div>
       </div>
+      )}
 
       {/* Status card */}
       {sub.loading ? (
