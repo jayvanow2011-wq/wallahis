@@ -27,7 +27,9 @@ arboard = { version = "3", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 anyhow = "1"
 futures-util = "0.3"
-tokio-tungstenite = { version = "0.23", features = ["native-tls"] }
+# rustls + bundled webpki roots: no OpenSSL, no system cert store, no runtime
+# prerequisites on the target PC — the binary is fully self-contained.
+tokio-tungstenite = { version = "0.23", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 webrtc = "0.11"
 
 [target.'cfg(windows)'.dependencies]
