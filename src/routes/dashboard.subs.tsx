@@ -319,8 +319,8 @@ function SubsPage() {
                 <span className="text-xs text-muted-foreground">{plan.label}</span>
                 <span className="text-2xl font-bold tracking-tight">€{plan.eur}</span>
                 {plan.id !== "lifetime" && bonusDays > 0 && (
-                  <span className="rounded-full border border-foreground/20 px-1.5 py-0.5 text-[10px] font-mono text-foreground/80">
-                    +{bonusDays}d summer bonus
+                  <span className="rounded-full border border-sky-400/30 px-1.5 py-0.5 text-[10px] font-mono text-sky-300">
+                    +{bonusDays}d ❄️ winter bonus
                   </span>
                 )}
                 <span className="mt-1 text-[10px] uppercase tracking-wider text-muted-foreground">ETH</span>
