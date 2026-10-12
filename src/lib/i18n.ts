@@ -3,6 +3,17 @@ import { useCustomization, type Language } from "@/lib/customization-context";
 type Dict = Record<string, string>;
 
 const EN: Dict = {
+  navOverview: "Overview",
+  navClients: "Clients",
+  navBuilder: "Builder",
+  navAds: "Ads",
+  navCommunity: "Community",
+  navRefer: "Refer",
+  navNotifications: "Notifications",
+  navSubs: "Subscriptions",
+  navSettings: "Settings",
+  navAdmin: "Admin",
+  signOut: "Sign out",
   settings: "Settings",
   profile: "Profile",
   theme: "Theme",
@@ -52,6 +63,17 @@ const EN: Dict = {
 };
 
 const RU: Dict = {
+  navOverview: "Обзор",
+  navClients: "Клиенты",
+  navBuilder: "Сборщик",
+  navAds: "Реклама",
+  navCommunity: "Сообщество",
+  navRefer: "Рефералы",
+  navNotifications: "Уведомления",
+  navSubs: "Подписки",
+  navSettings: "Настройки",
+  navAdmin: "Админ",
+  signOut: "Выйти",
   settings: "Настройки",
   profile: "Профиль",
   theme: "Тема",
@@ -101,6 +123,17 @@ const RU: Dict = {
 };
 
 const NL: Dict = {
+  navOverview: "Overzicht",
+  navClients: "Clients",
+  navBuilder: "Builder",
+  navAds: "Advertenties",
+  navCommunity: "Community",
+  navRefer: "Doorverwijzen",
+  navNotifications: "Meldingen",
+  navSubs: "Abonnementen",
+  navSettings: "Instellingen",
+  navAdmin: "Beheer",
+  signOut: "Uitloggen",
   settings: "Instellingen",
   profile: "Profiel",
   theme: "Thema",

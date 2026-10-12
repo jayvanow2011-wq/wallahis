@@ -124,10 +124,6 @@ function SignupPage() {
   return (
     <main className="relative flex min-h-screen items-start justify-center px-4 py-10">
       
-      <div className="pointer-events-none fixed inset-0 -z-10">
-        <div className="absolute left-1/2 top-0 h-[420px] w-[640px] -translate-x-1/2 rounded-full opacity-[0.18] blur-3xl"
-          style={{ background: "radial-gradient(closest-side, var(--color-foreground), transparent)" }} />
-      </div>
 
       <div className="w-full max-w-[460px]">
         <div className="mb-8 flex justify-center">

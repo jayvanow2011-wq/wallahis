@@ -12,7 +12,8 @@ import {
 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useCustomization } from "@/lib/customization-context";
-import { LANGUAGES } from "@/lib/i18n";
+import { LANGUAGES, useT } from "@/lib/i18n";
+import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 
 
 export const Route = createFileRoute("/dashboard")({
@@ -29,7 +30,7 @@ function DashboardLayout() {
   const [isAdmin, setIsAdmin] = useState(false);
   const { customization, update } = useCustomization();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [langOpen, setLangOpen] = useState(false);
+  const t = useT();
 
   useEffect(() => {
     if (!loading && !authed) navigate({ to: "/" });
@@ -59,17 +60,17 @@ function DashboardLayout() {
   };
 
   const baseNav = [
-    { to: "/dashboard", label: "Overview", icon: LayoutDashboard, exact: true },
-    { to: "/dashboard/clients", label: "Clients", icon: Users, exact: false },
-    { to: "/dashboard/builder", label: "Builder", icon: Wrench, exact: false },
-    { to: "/dashboard/ads", label: "Ads", icon: Megaphone, exact: false },
-    { to: "/dashboard/community", label: "Community", icon: MessagesSquare, exact: false },
-    { to: "/dashboard/refer", label: "Refer", icon: Gift, exact: false },
-    { to: "/dashboard/notifications", label: "Notifications", icon: Bell, exact: false },
-    { to: "/dashboard/subs", label: "Subscriptions", icon: CreditCard, exact: false },
-    { to: "/dashboard/settings", label: "Settings", icon: SettingsIcon, exact: false },
+    { to: "/dashboard", label: t("navOverview"), icon: LayoutDashboard, exact: true },
+    { to: "/dashboard/clients", label: t("navClients"), icon: Users, exact: false },
+    { to: "/dashboard/builder", label: t("navBuilder"), icon: Wrench, exact: false },
+    { to: "/dashboard/ads", label: t("navAds"), icon: Megaphone, exact: false },
+    { to: "/dashboard/community", label: t("navCommunity"), icon: MessagesSquare, exact: false },
+    { to: "/dashboard/refer", label: t("navRefer"), icon: Gift, exact: false },
+    { to: "/dashboard/notifications", label: t("navNotifications"), icon: Bell, exact: false },
+    { to: "/dashboard/subs", label: t("navSubs"), icon: CreditCard, exact: false },
+    { to: "/dashboard/settings", label: t("navSettings"), icon: SettingsIcon, exact: false },
     ...(isAdmin
-      ? [{ to: "/dashboard/admin", label: "Admin", icon: ShieldCheck, exact: false }]
+      ? [{ to: "/dashboard/admin", label: t("navAdmin"), icon: ShieldCheck, exact: false }]
       : []),
   ];
 
@@ -102,7 +103,6 @@ function DashboardLayout() {
     return <div className="flex min-h-screen items-center justify-center text-sm text-muted-foreground">Loading…</div>;
   }
 
-  const currentLang = LANGUAGES.find(l => l.id === customization.language) ?? LANGUAGES[0];
 
   return (
     <div className="flex min-h-screen flex-col">
@@ -129,26 +129,7 @@ function DashboardLayout() {
           </div>
           <div className="flex items-center gap-2">
             {!sub.loading && <CountdownBadge msLeft={sub.msLeft} />}
-            {/* Language switcher */}
-            <div className="relative">
-              <button onClick={() => setLangOpen(!langOpen)} className="flex items-center gap-1 rounded-md px-2 py-1.5 text-xs text-muted-foreground hover:bg-accent hover:text-foreground transition" title="Language">
-                <Globe className="h-3.5 w-3.5" />
-                <span>{currentLang.flag}</span>
-              </button>
-              {langOpen && (
-                <>
-                  <div className="fixed inset-0 z-40" onClick={() => setLangOpen(false)} />
-                  <div className="absolute right-0 top-full z-50 mt-1 w-36 rounded-lg border border-border bg-card p-1 shadow-xl">
-                    {LANGUAGES.map(l => (
-                      <button key={l.id} onClick={() => { update("language", l.id); setLangOpen(false); }}
-                        className={`flex w-full items-center gap-2 rounded-md px-3 py-2 text-xs transition ${customization.language === l.id ? "bg-secondary text-foreground" : "text-muted-foreground hover:bg-accent hover:text-foreground"}`}>
-                        <span>{l.flag}</span> {l.label}
-                      </button>
-                    ))}
-                  </div>
-                </>
-              )}
-            </div>
+            <LanguageSwitcher compact={false} />
             {profile?.avatar_url ? (
               <img src={profile.avatar_url} alt="" className="h-8 w-8 rounded-full object-cover border border-border" />
             ) : <div className="h-8 w-8 rounded-full bg-muted" />}
@@ -190,25 +171,7 @@ function DashboardLayout() {
           </button>
           <span className="text-sm font-semibold tracking-tight font-mono">fudrat.lol</span>
           <div className="flex items-center gap-1">
-            {/* Mobile language */}
-            <div className="relative">
-              <button onClick={() => setLangOpen(!langOpen)} className="rounded-md p-2 text-muted-foreground hover:bg-accent">
-                <Globe className="h-4 w-4" />
-              </button>
-              {langOpen && (
-                <>
-                  <div className="fixed inset-0 z-40" onClick={() => setLangOpen(false)} />
-                  <div className="absolute right-0 top-full z-50 mt-1 w-36 rounded-lg border border-border bg-card p-1 shadow-xl">
-                    {LANGUAGES.map(l => (
-                      <button key={l.id} onClick={() => { update("language", l.id); setLangOpen(false); }}
-                        className={`flex w-full items-center gap-2 rounded-md px-3 py-2 text-xs transition ${customization.language === l.id ? "bg-secondary text-foreground" : "text-muted-foreground hover:bg-accent hover:text-foreground"}`}>
-                        <span>{l.flag}</span> {l.label}
-                      </button>
-                    ))}
-                  </div>
-                </>
-              )}
-            </div>
+            <LanguageSwitcher compact={true} />
             {profile?.avatar_url ? (
               <img src={profile.avatar_url} alt="" className="h-7 w-7 rounded-full object-cover border border-border" />
             ) : <div className="h-7 w-7 rounded-full bg-muted" />}
