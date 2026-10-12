@@ -192,6 +192,7 @@ function SubsPage() {
   };
 
   const low = sub.active && isFinite(sub.msLeft) && sub.msLeft < 1000 * 60 * 60 * 24 * 3;
+  const BONUS = winterSale.enabled ? winterSale.multiplier : 1.0;
 
   return (
     <div className="mx-auto max-w-4xl space-y-6">
@@ -207,26 +208,27 @@ function SubsPage() {
         </div>
       </div>
 
-      {/* Summer sale banner */}
-      <div className="relative overflow-hidden rounded-xl border border-border bg-card p-5">
-        <div className="absolute inset-0 -z-10 opacity-30" style={{ background: "radial-gradient(600px circle at 0% 0%, oklch(0.7 0.18 60 / 0.35), transparent 60%), radial-gradient(500px circle at 100% 100%, oklch(0.65 0.2 25 / 0.3), transparent 55%)" }} />
+      {/* Winter sale banner */}
+      {winterSale.enabled && (
+      <div className="relative overflow-hidden rounded-xl border border-sky-400/30 bg-gradient-to-br from-sky-950/40 via-card to-card p-5">
+        <div className="absolute inset-0 -z-10 opacity-20" style={{ background: "radial-gradient(600px circle at 0% 0%, oklch(0.7 0.15 220 / 0.4), transparent 60%), radial-gradient(500px circle at 100% 100%, oklch(0.7 0.1 250 / 0.3), transparent 55%)" }} />
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-border bg-background">
-              <Sun className="h-5 w-5 text-foreground" />
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-sky-400/30 bg-sky-950/40">
+              <Snowflake className="h-5 w-5 text-sky-300" />
             </div>
             <div>
               <div className="flex items-center gap-2 text-sm font-semibold">
-                Summer Sale
-                <span className="rounded-full border border-foreground/30 bg-foreground/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider">Limited</span>
+                ❄️ Winter Sale
+                <span className="rounded-full border border-sky-400/30 bg-sky-400/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-sky-300">Limited</span>
               </div>
               <div className="text-xs text-muted-foreground">
-                <span className="font-mono text-foreground">×{BONUS}</span> longer subscriptions, auto-applied.
+                <span className="font-mono text-sky-300">×{BONUS}</span> longer subscriptions, auto-applied.
               </div>
             </div>
           </div>
           <div className="font-mono text-xs text-muted-foreground">
-            <span className="text-foreground">+{Math.round((BONUS - 1) * 100)}%</span> bonus days
+            <span className="text-sky-300">+{Math.round((BONUS - 1) * 100)}%</span> bonus days
           </div>
         </div>
       </div>
