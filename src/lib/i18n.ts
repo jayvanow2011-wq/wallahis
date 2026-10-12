@@ -3,6 +3,8 @@ import { useCustomization, type Language } from "@/lib/customization-context";
 type Dict = Record<string, string>;
 
 const EN: Dict = {
+  navChat: "Chat",
+  navTickets: "Tickets",
   navOverview: "Overview",
   navClients: "Clients",
   navBuilder: "Builder",
@@ -63,6 +65,8 @@ const EN: Dict = {
 };
 
 const RU: Dict = {
+  navChat: "Чат",
+  navTickets: "Тикеты",
   navOverview: "Обзор",
   navClients: "Клиенты",
   navBuilder: "Сборщик",
@@ -123,6 +127,8 @@ const RU: Dict = {
 };
 
 const NL: Dict = {
+  navChat: "Berichten",
+  navTickets: "Tickets",
   navOverview: "Overzicht",
   navClients: "Clients",
   navBuilder: "Builder",

@@ -6,11 +6,11 @@ import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 import { useSubscription, formatCountdown } from "@/lib/use-subscription";
 import { getEthQuote, createEthOrder, checkEthPayment, checkWalletBalance } from "@/lib/payments.functions";
-import { Clock, Check, Loader2, Sparkles, ArrowUp, Sun, Copy, ExternalLink, AlertTriangle } from "lucide-react";
+import { Clock, Check, Loader2, Sparkles, ArrowUp, Snowflake, Copy, ExternalLink, AlertTriangle } from "lucide-react";
 
 export const Route = createFileRoute("/dashboard/subs")({ component: SubsPage });
 
-const BONUS = 1.0; // no bonus currently
+const WINTER_BONUS = 1.2; // 1.2x winter sale
 const PLANS: { id: string; label: string; eur: number; days: number; popular?: boolean; best?: boolean }[] = [
   { id: "3days", label: "3 Days", eur: 10, days: 3 },
   { id: "30days", label: "30 Days", eur: 20, days: 30, popular: true },
@@ -34,6 +34,7 @@ function SubsPage() {
   const { user } = useAuth();
   const sub = useSubscription(user?.id);
   const [payEnabled, setPayEnabled] = useState(true);
+  const [winterSale, setWinterSale] = useState<{ enabled: boolean; multiplier: number }>({ enabled: true, multiplier: 1.2 });
   const [payMode, setPayMode] = useState<"live" | "sandbox">("live");
 
   // Modal state
@@ -54,12 +55,19 @@ function SubsPage() {
   const checkBal = useServerFn(checkWalletBalance);
 
   useEffect(() => {
-    supabase.from("app_settings").select("value").eq("key", "payments").maybeSingle()
+    supabase.from("app_settings").select("key,value").in("key", ["payments", "winter_sale"])
       .then(({ data }) => {
-        const v = (data?.value ?? {}) as { enabled?: boolean; mode?: "live" | "sandbox" };
-        setPayEnabled(v.enabled !== false);
-        setPayMode(v.mode === "sandbox" ? "sandbox" : "live");
-      });
+        for (const row of data ?? []) {
+          if (row.key === "payments") {
+            const v = (row.value ?? {}) as { enabled?: boolean; mode?: "live" | "sandbox" };
+            setPayEnabled(v.enabled !== false);
+            setPayMode(v.mode === "sandbox" ? "sandbox" : "live");
+          }
+          if (row.key === "winter_sale") {
+            const v = (row.value ?? {}) as { enabled?: boolean; multiplier?: number };
+            setWinterSale({ enabled: v.enabled !== false, multiplier: v.multiplier ?? 1.2 });
+          }
+        }
   }, []);
 
   const loadPending = useCallback(async () => {
@@ -184,6 +192,7 @@ function SubsPage() {
   };
 
   const low = sub.active && isFinite(sub.msLeft) && sub.msLeft < 1000 * 60 * 60 * 24 * 3;
+  const BONUS = winterSale.enabled ? winterSale.multiplier : 1.0;
 
   return (
     <div className="mx-auto max-w-4xl space-y-6">
@@ -199,29 +208,31 @@ function SubsPage() {
         </div>
       </div>
 
-      {/* Summer sale banner */}
-      <div className="relative overflow-hidden rounded-xl border border-border bg-card p-5">
-        <div className="absolute inset-0 -z-10 opacity-30" style={{ background: "radial-gradient(600px circle at 0% 0%, oklch(0.7 0.18 60 / 0.35), transparent 60%), radial-gradient(500px circle at 100% 100%, oklch(0.65 0.2 25 / 0.3), transparent 55%)" }} />
+      {/* Winter sale banner */}
+      {winterSale.enabled && (
+      <div className="relative overflow-hidden rounded-xl border border-sky-400/30 bg-gradient-to-br from-sky-950/40 via-card to-card p-5">
+        <div className="absolute inset-0 -z-10 opacity-20" style={{ background: "radial-gradient(600px circle at 0% 0%, oklch(0.7 0.15 220 / 0.4), transparent 60%), radial-gradient(500px circle at 100% 100%, oklch(0.7 0.1 250 / 0.3), transparent 55%)" }} />
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-border bg-background">
-              <Sun className="h-5 w-5 text-foreground" />
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-sky-400/30 bg-sky-950/40">
+              <Snowflake className="h-5 w-5 text-sky-300" />
             </div>
             <div>
               <div className="flex items-center gap-2 text-sm font-semibold">
-                Summer Sale
-                <span className="rounded-full border border-foreground/30 bg-foreground/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider">Limited</span>
+                ❄️ Winter Sale
+                <span className="rounded-full border border-sky-400/30 bg-sky-400/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-sky-300">Limited</span>
               </div>
               <div className="text-xs text-muted-foreground">
-                <span className="font-mono text-foreground">×{BONUS}</span> longer subscriptions, auto-applied.
+                <span className="font-mono text-sky-300">×{BONUS}</span> longer subscriptions, auto-applied.
               </div>
             </div>
           </div>
           <div className="font-mono text-xs text-muted-foreground">
-            <span className="text-foreground">+{Math.round((BONUS - 1) * 100)}%</span> bonus days
+            <span className="text-sky-300">+{Math.round((BONUS - 1) * 100)}%</span> bonus days
           </div>
         </div>
       </div>
+      )}
 
       {/* Status card */}
       {sub.loading ? (
@@ -308,8 +319,8 @@ function SubsPage() {
                 <span className="text-xs text-muted-foreground">{plan.label}</span>
                 <span className="text-2xl font-bold tracking-tight">€{plan.eur}</span>
                 {plan.id !== "lifetime" && bonusDays > 0 && (
-                  <span className="rounded-full border border-foreground/20 px-1.5 py-0.5 text-[10px] font-mono text-foreground/80">
-                    +{bonusDays}d summer bonus
+                  <span className="rounded-full border border-sky-400/30 px-1.5 py-0.5 text-[10px] font-mono text-sky-300">
+                    +{bonusDays}d ❄️ winter bonus
                   </span>
                 )}
                 <span className="mt-1 text-[10px] uppercase tracking-wider text-muted-foreground">ETH</span>

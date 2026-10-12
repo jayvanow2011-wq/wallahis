@@ -758,7 +758,9 @@ export type Database = {
           id: string
           is_banned: boolean
           is_removed: boolean
+          language: string
           profile_completed: boolean
+          public_key: string | null
           recovery_token_hash: string | null
           recovery_token_set_at: string | null
           referral_code: string | null
@@ -788,7 +790,9 @@ export type Database = {
           id: string
           is_banned?: boolean
           is_removed?: boolean
+          language?: string
           profile_completed?: boolean
+          public_key?: string | null
           recovery_token_hash?: string | null
           recovery_token_set_at?: string | null
           referral_code?: string | null
@@ -818,7 +822,9 @@ export type Database = {
           id?: string
           is_banned?: boolean
           is_removed?: boolean
+          language?: string
           profile_completed?: boolean
+          public_key?: string | null
           recovery_token_hash?: string | null
           recovery_token_set_at?: string | null
           referral_code?: string | null
@@ -1008,6 +1014,74 @@ export type Database = {
           started_at?: string | null
           status?: string
           tx_hash?: string | null
+          user_id?: string
+        }
+        Relationships: []
+      }
+      ticket_messages: {
+        Row: {
+          body: string | null
+          created_at: string
+          id: string
+          image_url: string | null
+          sender_id: string
+          ticket_id: string
+        }
+        Insert: {
+          body?: string | null
+          created_at?: string
+          id?: string
+          image_url?: string | null
+          sender_id: string
+          ticket_id: string
+        }
+        Update: {
+          body?: string | null
+          created_at?: string
+          id?: string
+          image_url?: string | null
+          sender_id?: string
+          ticket_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "ticket_messages_ticket_id_fkey"
+            columns: ["ticket_id"]
+            isOneToOne: false
+            referencedRelation: "tickets"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      tickets: {
+        Row: {
+          claimed_by: string | null
+          closed_at: string | null
+          created_at: string
+          id: string
+          status: string
+          subject: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          claimed_by?: string | null
+          closed_at?: string | null
+          created_at?: string
+          id?: string
+          status?: string
+          subject: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          claimed_by?: string | null
+          closed_at?: string | null
+          created_at?: string
+          id?: string
+          status?: string
+          subject?: string
+          updated_at?: string
           user_id?: string
         }
         Relationships: []
@@ -1249,7 +1323,7 @@ export type Database = {
           }
     }
     Enums: {
-      app_role: "admin" | "operator" | "viewer"
+      app_role: "admin" | "operator" | "viewer" | "helper"
     }
     CompositeTypes: {
       http_header: {
@@ -1393,7 +1467,7 @@ export type CompositeTypes<
 export const Constants = {
   public: {
     Enums: {
-      app_role: ["admin", "operator", "viewer"],
+      app_role: ["admin", "operator", "viewer", "helper"],
     },
   },
 } as const

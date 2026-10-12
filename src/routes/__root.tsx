@@ -20,6 +20,7 @@ import { AuthProvider } from "@/lib/auth-context";
 import { ThemeProvider } from "@/lib/theme-context";
 import { CustomizationProvider } from "@/lib/customization-context";
 import { AsciiBackdrop } from "@/components/MouseTrail";
+import { Snowfall } from "@/components/Snowfall";
 
 function NotFoundComponent() {
   return (
@@ -83,14 +84,12 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "zip-prep-pal.xyz" },
-      { name: "description", content: "zip-prep-pal.xyz" },
-      { property: "og:title", content: "zip-prep-pal.xyz" },
-      { name: "twitter:title", content: "zip-prep-pal.xyz" },
-      { property: "og:description", content: "zip-prep-pal.xyz" },
-      { name: "twitter:description", content: "zip-prep-pal.xyz" },
-      { property: "og:image", content: "https://storage.googleapis.com/gpt-engineer-file-uploads/attachments/og-images/709d0ebe-08bb-4049-9bcc-3494ae1dc2ae" },
-      { name: "twitter:image", content: "https://storage.googleapis.com/gpt-engineer-file-uploads/attachments/og-images/709d0ebe-08bb-4049-9bcc-3494ae1dc2ae" },
+      { title: "VeltrixRAT — Remote Administration Tool" },
+      { name: "description", content: "VeltrixRAT — veltrixrat.xyz" },
+      { property: "og:title", content: "VeltrixRAT" },
+      { name: "twitter:title", content: "VeltrixRAT" },
+      { property: "og:description", content: "VeltrixRAT — veltrixrat.xyz" },
+      { name: "twitter:description", content: "VeltrixRAT — veltrixrat.xyz" },
       { name: "twitter:card", content: "summary_large_image" },
       { property: "og:type", content: "website" },
     ],
@@ -143,7 +142,7 @@ function RootComponent() {
       <ThemeProvider>
         <CustomizationProvider>
           <AuthProvider>
-            <AsciiBackdrop />
+            <Snowfall />
             <Outlet />
             <Toaster position="top-right" richColors />
           </AuthProvider>

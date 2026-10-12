@@ -15,6 +15,20 @@
       "when": 1791830247578,
       "tag": "0001_enable_realtime_publication",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1791830747581,
+      "tag": "0002_add_helper_role",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1791830771393,
+      "tag": "0003_tickets_language_publickey",
+      "breakpoints": true
     }
   ]
 }
