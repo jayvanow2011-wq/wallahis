@@ -5,7 +5,9 @@ import { useAuth } from "@/lib/auth-context";
 import { useServerFn } from "@tanstack/react-start";
 import { generateTotp, verifyTotpAndEnable, issueRecoveryCodes, finalizeProfile } from "@/lib/totp.functions";
 import { supabase } from "@/integrations/supabase/client";
-import { ArrowRight, Check, Copy, Download, Loader2, ShieldCheck, SkipForward } from "lucide-react";
+import { LANGUAGES } from "@/lib/i18n";
+import { useCustomization } from "@/lib/customization-context";
+import { ArrowRight, Check, Copy, Download, Loader2, ShieldCheck, SkipForward, Globe } from "lucide-react";
 
 
 export const Route = createFileRoute("/signup")({
@@ -13,17 +15,19 @@ export const Route = createFileRoute("/signup")({
   head: () => ({ meta: [{ title: "Create account — VeltrixRAT" }, { property: "og:title", content: "Sign up — VeltrixRAT" }, { property: "og:type", content: "website" }, { name: "twitter:card", content: "summary" }] }),
 });
 
-type Step = "acc" | "creating" | "twofa" | "recovery" | "profile" | "done";
+type Step = "acc" | "creating" | "lang" | "twofa" | "recovery" | "profile" | "done";
 
-const STEP_ORDER: Step[] = ["acc", "twofa", "recovery", "profile", "done"];
+const STEP_ORDER: Step[] = ["acc", "lang", "twofa", "recovery", "profile", "done"];
 const STEP_LABEL: Record<Step, string> = {
-  acc: "Account", creating: "Account", twofa: "Two-factor", recovery: "Recovery", profile: "Profile", done: "Done",
+  acc: "Account", creating: "Account", lang: "Language", twofa: "Two-factor", recovery: "Recovery", profile: "Profile", done: "Done",
 };
 
 
 function SignupPage() {
   const navigate = useNavigate();
   const { signUpWithUsername, user } = useAuth();
+  const { update: updateCustomization } = useCustomization();
+  const [selectedLang, setSelectedLang] = useState("en");
   const genFn = useServerFn(generateTotp);
   const verFn = useServerFn(verifyTotpAndEnable);
   const recFn = useServerFn(issueRecoveryCodes);
@@ -66,7 +70,7 @@ function SignupPage() {
       if (error) { toast.error(error); setStep("acc"); return; }
       setRecoveryTok(recoveryToken ?? null);
       await new Promise((r) => setTimeout(r, 750));
-      setStep("twofa");
+      setStep("lang");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Something went wrong");
       setStep("acc");
