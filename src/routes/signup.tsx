@@ -10,7 +10,7 @@ import { ArrowRight, Check, Copy, Download, Loader2, ShieldCheck, SkipForward } 
 
 export const Route = createFileRoute("/signup")({
   component: SignupPage,
-  head: () => ({ meta: [{ title: "Create account — zip-prep-pal.xyz" }] }),
+  head: () => ({ meta: [{ title: "Create account — VeltrixRAT" }, { property: "og:title", content: "Sign up — VeltrixRAT" }, { property: "og:type", content: "website" }, { name: "twitter:card", content: "summary" }] }),
 });
 
 type Step = "acc" | "creating" | "twofa" | "recovery" | "profile" | "done";
@@ -128,7 +128,7 @@ function SignupPage() {
       <div className="w-full max-w-[460px]">
         <div className="mb-8 flex justify-center">
           <Link to="/" className="flex items-center gap-2 text-foreground">
-            <span className="text-lg font-semibold tracking-tight font-mono">fudrat.lol</span>
+            <span className="text-lg font-semibold tracking-tight font-mono">VeltrixRAT</span>
           </Link>
         </div>
 

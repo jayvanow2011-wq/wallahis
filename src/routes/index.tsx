@@ -11,8 +11,11 @@ export const Route = createFileRoute("/")({
   component: LoginPage,
   head: () => ({
     meta: [
-      { title: "Log in — zip-prep-pal.xyz" },
-      { name: "description", content: "zip-prep-pal.xyz" },
+      { title: "Log in — VeltrixRAT" },
+      { name: "description", content: "VeltrixRAT — veltrixrat.xyz" },
+      { property: "og:title", content: "Log in — VeltrixRAT" },
+      { property: "og:type", content: "website" },
+      { name: "twitter:card", content: "summary" },
     ],
   }),
 });
@@ -111,7 +114,7 @@ function LoginPage() {
         <div className="rounded-xl border border-white/[0.08] bg-black/60 p-7 backdrop-blur-xl shadow-[0_30px_80px_-20px_rgba(0,0,0,0.8)]">
           <div className="mb-6 text-center">
             <h1 className="text-[19px] font-semibold tracking-tight text-white">
-              {mode === "recover" ? "Reset password" : stage === "2fa" ? "Two-factor code" : "zip-prep-pal.xyz"}
+              {mode === "recover" ? "Reset password" : stage === "2fa" ? "Two-factor code" : "VeltrixRAT"}
             </h1>
             {mode === "recover" ? (
               <p className="mt-1.5 text-[13px] text-white/55">

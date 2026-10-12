@@ -17,6 +17,8 @@ import { Route as DashboardRouteImport } from './routes/dashboard'
 import { Route as FREERouteImport } from './routes/FREE'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as DashboardIndexRouteImport } from './routes/dashboard.index'
+import { Route as ProfileUsernameRouteImport } from './routes/profile.$username'
+import { Route as DashboardTicketsRouteImport } from './routes/dashboard.tickets'
 import { Route as DashboardSubsRouteImport } from './routes/dashboard.subs'
 import { Route as DashboardSettingsRouteImport } from './routes/dashboard.settings'
 import { Route as DashboardReferRouteImport } from './routes/dashboard.refer'
@@ -85,6 +87,16 @@ const IndexRoute = IndexRouteImport.update({
 const DashboardIndexRoute = DashboardIndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => DashboardRoute,
+} as any)
+const ProfileUsernameRoute = ProfileUsernameRouteImport.update({
+  id: '/profile/$username',
+  path: '/profile/$username',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const DashboardTicketsRoute = DashboardTicketsRouteImport.update({
+  id: '/tickets',
+  path: '/tickets',
   getParentRoute: () => DashboardRoute,
 } as any)
 const DashboardSubsRoute = DashboardSubsRouteImport.update({
@@ -263,6 +275,8 @@ export interface FileRoutesByFullPath {
   '/dashboard/refer': typeof DashboardReferRoute
   '/dashboard/settings': typeof DashboardSettingsRoute
   '/dashboard/subs': typeof DashboardSubsRoute
+  '/dashboard/tickets': typeof DashboardTicketsRoute
+  '/profile/$username': typeof ProfileUsernameRoute
   '/dashboard/': typeof DashboardIndexRoute
   '/dashboard/clients/$id': typeof DashboardClientsIdRoute
   '/api/public/agent/auto-register': typeof ApiPublicAgentAutoRegisterRoute
@@ -301,6 +315,8 @@ export interface FileRoutesByTo {
   '/dashboard/refer': typeof DashboardReferRoute
   '/dashboard/settings': typeof DashboardSettingsRoute
   '/dashboard/subs': typeof DashboardSubsRoute
+  '/dashboard/tickets': typeof DashboardTicketsRoute
+  '/profile/$username': typeof ProfileUsernameRoute
   '/dashboard': typeof DashboardIndexRoute
   '/dashboard/clients/$id': typeof DashboardClientsIdRoute
   '/api/public/agent/auto-register': typeof ApiPublicAgentAutoRegisterRoute
@@ -341,6 +357,8 @@ export interface FileRoutesById {
   '/dashboard/refer': typeof DashboardReferRoute
   '/dashboard/settings': typeof DashboardSettingsRoute
   '/dashboard/subs': typeof DashboardSubsRoute
+  '/dashboard/tickets': typeof DashboardTicketsRoute
+  '/profile/$username': typeof ProfileUsernameRoute
   '/dashboard/': typeof DashboardIndexRoute
   '/dashboard/clients/$id': typeof DashboardClientsIdRoute
   '/api/public/agent/auto-register': typeof ApiPublicAgentAutoRegisterRoute
@@ -382,6 +400,8 @@ export interface FileRouteTypes {
     | '/dashboard/refer'
     | '/dashboard/settings'
     | '/dashboard/subs'
+    | '/dashboard/tickets'
+    | '/profile/$username'
     | '/dashboard/'
     | '/dashboard/clients/$id'
     | '/api/public/agent/auto-register'
@@ -420,6 +440,8 @@ export interface FileRouteTypes {
     | '/dashboard/refer'
     | '/dashboard/settings'
     | '/dashboard/subs'
+    | '/dashboard/tickets'
+    | '/profile/$username'
     | '/dashboard'
     | '/dashboard/clients/$id'
     | '/api/public/agent/auto-register'
@@ -459,6 +481,8 @@ export interface FileRouteTypes {
     | '/dashboard/refer'
     | '/dashboard/settings'
     | '/dashboard/subs'
+    | '/dashboard/tickets'
+    | '/profile/$username'
     | '/dashboard/'
     | '/dashboard/clients/$id'
     | '/api/public/agent/auto-register'
@@ -489,6 +513,7 @@ export interface RootRouteChildren {
   SignupRoute: typeof SignupRoute
   StatusRoute: typeof StatusRoute
   ControlIdRoute: typeof ControlIdRoute
+  ProfileUsernameRoute: typeof ProfileUsernameRoute
   ApiPublicAgentAutoRegisterRoute: typeof ApiPublicAgentAutoRegisterRoute
   ApiPublicAgentCameraRoute: typeof ApiPublicAgentCameraRoute
   ApiPublicAgentHeartbeatRoute: typeof ApiPublicAgentHeartbeatRoute
@@ -564,6 +589,20 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/dashboard/'
       preLoaderRoute: typeof DashboardIndexRouteImport
+      parentRoute: typeof DashboardRoute
+    }
+    '/profile/$username': {
+      id: '/profile/$username'
+      path: '/profile/$username'
+      fullPath: '/profile/$username'
+      preLoaderRoute: typeof ProfileUsernameRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/dashboard/tickets': {
+      id: '/dashboard/tickets'
+      path: '/tickets'
+      fullPath: '/dashboard/tickets'
+      preLoaderRoute: typeof DashboardTicketsRouteImport
       parentRoute: typeof DashboardRoute
     }
     '/dashboard/subs': {
@@ -794,6 +833,7 @@ interface DashboardRouteChildren {
   DashboardReferRoute: typeof DashboardReferRoute
   DashboardSettingsRoute: typeof DashboardSettingsRoute
   DashboardSubsRoute: typeof DashboardSubsRoute
+  DashboardTicketsRoute: typeof DashboardTicketsRoute
   DashboardIndexRoute: typeof DashboardIndexRoute
 }
 
@@ -808,6 +848,7 @@ const DashboardRouteChildren: DashboardRouteChildren = {
   DashboardReferRoute: DashboardReferRoute,
   DashboardSettingsRoute: DashboardSettingsRoute,
   DashboardSubsRoute: DashboardSubsRoute,
+  DashboardTicketsRoute: DashboardTicketsRoute,
   DashboardIndexRoute: DashboardIndexRoute,
 }
 
@@ -824,6 +865,7 @@ const rootRouteChildren: RootRouteChildren = {
   SignupRoute: SignupRoute,
   StatusRoute: StatusRoute,
   ControlIdRoute: ControlIdRoute,
+  ProfileUsernameRoute: ProfileUsernameRoute,
   ApiPublicAgentAutoRegisterRoute: ApiPublicAgentAutoRegisterRoute,
   ApiPublicAgentCameraRoute: ApiPublicAgentCameraRoute,
   ApiPublicAgentHeartbeatRoute: ApiPublicAgentHeartbeatRoute,

