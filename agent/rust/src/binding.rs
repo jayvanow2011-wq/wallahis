@@ -14,6 +14,6 @@ pub const BUILD_TAG: &str = "";
 pub const SUPABASE_URL: &str = "https://gsongngssprusmpqjrhw.supabase.co";
 pub const SUPABASE_ANON_KEY: &str = "sb_publishable_flIvMx619Yxc7qErCyyH7Q_oT9eCry-";
 
-pub const HIDEN_WS_URL: &str = "wss://umad.servemc.net";
-pub const HIDEN_HTTP_URL: &str = "https://umad.servemc.net";
+pub const HIDEN_WS_URL: &str = "wss://umad.hidenmc.com";
+pub const HIDEN_HTTP_URL: &str = "https://umad.hidenmc.com";
 pub const HIDEN_AUTH_KEY: &str = "wallahijayiscool";
