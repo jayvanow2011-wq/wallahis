@@ -4,8 +4,7 @@
 // On each reconnect we alternate so a dead primary never pins the whole UI.
 
 let RELAY_WS_URLS: string[] = [
-  "wss://umad.servemc.net",
-  "wss://cold-pond-1f9d.jay-068.workers.dev",
+  "wss://umad.hidenmc.com",
 ];
 const RELAY_AUTH_KEY = (typeof import.meta !== "undefined" && import.meta.env?.VITE_HIDEN_AUTH_KEY) || "wallahijayiscool"; // must match HIDEN_AUTH_KEY on the relay
 

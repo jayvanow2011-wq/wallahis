@@ -1,12 +1,9 @@
 // Public relay discovery endpoint.
 //
-// Returns the ordered list of HidenHost relay endpoints the native agent
-// (and the browser client) should try. The agent polls this on startup and
-// after every disconnect so new relays can be rolled out without rebuilding
-// executables.
-//
-// Priority order: direct origin first (lowest latency), Cloudflare Worker
-// proxy second (bypasses ISP/corporate blocks of the custom hostname).
+// Reads active ws_relay rows from `server_endpoints` (admin-managed in the
+// dashboard). The default row is served first, then the rest by most-recent
+// update. If the table is empty or unreachable, falls back to a baked-in URL
+// so the native agent still has somewhere to connect.
 
 import { createFileRoute } from '@tanstack/react-router'
 
@@ -17,27 +14,64 @@ type Relay = {
   priority: number
 }
 
-const RELAYS: Relay[] = [
+const FALLBACK: Relay[] = [
   {
-    ws: 'wss://umad.servemc.net',
-    http: 'https://umad.servemc.net',
+    ws: 'wss://umad.hidenmc.com',
+    http: 'https://umad.hidenmc.com',
     via: 'direct',
     priority: 1,
   },
-  {
-    ws: 'wss://cold-pond-1f9d.jay-068.workers.dev',
-    http: 'https://cold-pond-1f9d.jay-068.workers.dev',
-    via: 'proxy',
-    priority: 2,
-  },
 ]
+
+function toRelay(url: string, priority: number): Relay | null {
+  const trimmed = url.trim().replace(/\/+$/, '')
+  if (!trimmed) return null
+  let ws: string
+  let http: string
+  if (trimmed.startsWith('wss://')) {
+    ws = trimmed
+    http = 'https://' + trimmed.slice('wss://'.length)
+  } else if (trimmed.startsWith('ws://')) {
+    ws = trimmed
+    http = 'http://' + trimmed.slice('ws://'.length)
+  } else if (trimmed.startsWith('https://')) {
+    http = trimmed
+    ws = 'wss://' + trimmed.slice('https://'.length)
+  } else if (trimmed.startsWith('http://')) {
+    http = trimmed
+    ws = 'ws://' + trimmed.slice('http://'.length)
+  } else {
+    ws = 'wss://' + trimmed
+    http = 'https://' + trimmed
+  }
+  const via: 'direct' | 'proxy' = /workers\.dev|cloudflare/i.test(ws) ? 'proxy' : 'direct'
+  return { ws, http, via, priority }
+}
 
 export const Route = createFileRoute('/api/public/relays')({
   server: {
     handlers: {
       GET: async () => {
+        let relays: Relay[] = []
+        try {
+          const { supabaseAdmin } = await import('@/integrations/supabase/client.server')
+          const { data } = await supabaseAdmin
+            .from('server_endpoints' as any)
+            .select('url,is_default,is_active,updated_at')
+            .eq('kind', 'ws_relay')
+            .eq('is_active', true)
+            .order('is_default', { ascending: false })
+            .order('updated_at', { ascending: false })
+          const rows = (data ?? []) as Array<{ url: string; is_default: boolean }>
+          relays = rows
+            .map((r, i) => toRelay(r.url, r.is_default ? 1 : 10 + i))
+            .filter((r): r is Relay => !!r)
+        } catch {
+          /* fall through to fallback */
+        }
+        if (relays.length === 0) relays = FALLBACK
         return new Response(
-          JSON.stringify({ relays: RELAYS, updated_at: Date.now() }),
+          JSON.stringify({ relays, updated_at: Date.now() }),
           {
             headers: {
               'Content-Type': 'application/json; charset=utf-8',

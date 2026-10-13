@@ -7,8 +7,7 @@
 import { createServerFn } from "@tanstack/react-start";
 
 const RELAY_URLS = [
-  { url: "https://umad.servemc.net", via: "direct" as const },
-  { url: "https://cold-pond-1f9d.jay-068.workers.dev", via: "proxy" as const },
+  { url: "https://umad.hidenmc.com", via: "direct" as const },
 ];
 const TIMEOUT_MS = 4000;
 
