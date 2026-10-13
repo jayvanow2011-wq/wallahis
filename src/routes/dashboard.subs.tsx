@@ -68,7 +68,9 @@ function SubsPage() {
             setWinterSale({ enabled: v.enabled !== false, multiplier: v.multiplier ?? 1.2 });
           }
         }
+      });
   }, []);
+
 
   const loadPending = useCallback(async () => {
     if (!user) return;
