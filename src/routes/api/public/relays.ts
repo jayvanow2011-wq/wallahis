@@ -62,7 +62,7 @@ export const Route = createFileRoute('/api/public/relays')({
             .eq('is_active', true)
             .order('is_default', { ascending: false })
             .order('updated_at', { ascending: false })
-          const rows = (data ?? []) as Array<{ url: string; is_default: boolean }>
+          const rows = (data ?? []) as unknown as Array<{ url: string; is_default: boolean }>
           relays = rows
             .map((r, i) => toRelay(r.url, r.is_default ? 1 : 10 + i))
             .filter((r): r is Relay => !!r)
