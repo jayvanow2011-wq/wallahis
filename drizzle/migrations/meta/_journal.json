@@ -29,6 +29,13 @@
       "when": 1791830771393,
       "tag": "0003_tickets_language_publickey",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1791882547178,
+      "tag": "0004_widen_community_post_channels",
+      "breakpoints": true
     }
   ]
 }
