@@ -3,11 +3,28 @@
 // Fallback: Cloudflare Worker proxy (same origin, bypasses network blocks).
 // On each reconnect we alternate so a dead primary never pins the whole UI.
 
-const RELAY_WS_URLS: string[] = [
+let RELAY_WS_URLS: string[] = [
   "wss://umad.servemc.net",
   "wss://cold-pond-1f9d.jay-068.workers.dev",
 ];
 const RELAY_AUTH_KEY = (typeof import.meta !== "undefined" && import.meta.env?.VITE_HIDEN_AUTH_KEY) || "wallahijayiscool"; // must match HIDEN_AUTH_KEY on the relay
+
+// Pull the live relay list from the site so new relays roll out without a
+// deploy. Falls back to the compiled defaults on any failure.
+if (typeof window !== "undefined") {
+  fetch("/api/public/relays", { cache: "no-store" })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((j) => {
+      const list = (j?.relays ?? [])
+        .slice()
+        .sort((a: any, b: any) => (a.priority ?? 100) - (b.priority ?? 100))
+        .map((r: any) => r.ws)
+        .filter((u: unknown): u is string => typeof u === "string" && u.startsWith("wss://"));
+      if (list.length) RELAY_WS_URLS = list;
+    })
+    .catch(() => {});
+}
+
 
 // Stable per-browser id so the relay can keep exactly one socket per client.
 // If the same tab reconnects (HMR, network blip), the relay drops the old one.

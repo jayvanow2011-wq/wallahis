@@ -31,6 +31,7 @@ import { Route as DashboardAdsRouteImport } from './routes/dashboard.ads'
 import { Route as DashboardAdminRouteImport } from './routes/dashboard.admin'
 import { Route as ControlIdRouteImport } from './routes/control.$id'
 import { Route as DashboardClientsIdRouteImport } from './routes/dashboard.clients.$id'
+import { Route as ApiPublicRelaysRouteImport } from './routes/api/public/relays'
 import { Route as ApiPublicNowpaymentsWebhookRouteImport } from './routes/api/public/nowpayments/webhook'
 import { Route as ApiPublicBuildserverWorkerScriptRouteImport } from './routes/api/public/buildserver/worker-script'
 import { Route as ApiPublicBuildserverUploadRouteImport } from './routes/api/public/buildserver/upload'
@@ -159,6 +160,11 @@ const DashboardClientsIdRoute = DashboardClientsIdRouteImport.update({
   path: '/$id',
   getParentRoute: () => DashboardClientsRoute,
 } as any)
+const ApiPublicRelaysRoute = ApiPublicRelaysRouteImport.update({
+  id: '/api/public/relays',
+  path: '/api/public/relays',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiPublicNowpaymentsWebhookRoute =
   ApiPublicNowpaymentsWebhookRouteImport.update({
     id: '/api/public/nowpayments/webhook',
@@ -278,6 +284,7 @@ export interface FileRoutesByFullPath {
   '/dashboard/tickets': typeof DashboardTicketsRoute
   '/profile/$username': typeof ProfileUsernameRoute
   '/dashboard/': typeof DashboardIndexRoute
+  '/api/public/relays': typeof ApiPublicRelaysRoute
   '/dashboard/clients/$id': typeof DashboardClientsIdRoute
   '/api/public/agent/auto-register': typeof ApiPublicAgentAutoRegisterRoute
   '/api/public/agent/camera': typeof ApiPublicAgentCameraRoute
@@ -318,6 +325,7 @@ export interface FileRoutesByTo {
   '/dashboard/tickets': typeof DashboardTicketsRoute
   '/profile/$username': typeof ProfileUsernameRoute
   '/dashboard': typeof DashboardIndexRoute
+  '/api/public/relays': typeof ApiPublicRelaysRoute
   '/dashboard/clients/$id': typeof DashboardClientsIdRoute
   '/api/public/agent/auto-register': typeof ApiPublicAgentAutoRegisterRoute
   '/api/public/agent/camera': typeof ApiPublicAgentCameraRoute
@@ -360,6 +368,7 @@ export interface FileRoutesById {
   '/dashboard/tickets': typeof DashboardTicketsRoute
   '/profile/$username': typeof ProfileUsernameRoute
   '/dashboard/': typeof DashboardIndexRoute
+  '/api/public/relays': typeof ApiPublicRelaysRoute
   '/dashboard/clients/$id': typeof DashboardClientsIdRoute
   '/api/public/agent/auto-register': typeof ApiPublicAgentAutoRegisterRoute
   '/api/public/agent/camera': typeof ApiPublicAgentCameraRoute
@@ -403,6 +412,7 @@ export interface FileRouteTypes {
     | '/dashboard/tickets'
     | '/profile/$username'
     | '/dashboard/'
+    | '/api/public/relays'
     | '/dashboard/clients/$id'
     | '/api/public/agent/auto-register'
     | '/api/public/agent/camera'
@@ -443,6 +453,7 @@ export interface FileRouteTypes {
     | '/dashboard/tickets'
     | '/profile/$username'
     | '/dashboard'
+    | '/api/public/relays'
     | '/dashboard/clients/$id'
     | '/api/public/agent/auto-register'
     | '/api/public/agent/camera'
@@ -484,6 +495,7 @@ export interface FileRouteTypes {
     | '/dashboard/tickets'
     | '/profile/$username'
     | '/dashboard/'
+    | '/api/public/relays'
     | '/dashboard/clients/$id'
     | '/api/public/agent/auto-register'
     | '/api/public/agent/camera'
@@ -514,6 +526,7 @@ export interface RootRouteChildren {
   StatusRoute: typeof StatusRoute
   ControlIdRoute: typeof ControlIdRoute
   ProfileUsernameRoute: typeof ProfileUsernameRoute
+  ApiPublicRelaysRoute: typeof ApiPublicRelaysRoute
   ApiPublicAgentAutoRegisterRoute: typeof ApiPublicAgentAutoRegisterRoute
   ApiPublicAgentCameraRoute: typeof ApiPublicAgentCameraRoute
   ApiPublicAgentHeartbeatRoute: typeof ApiPublicAgentHeartbeatRoute
@@ -688,6 +701,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/dashboard/clients/$id'
       preLoaderRoute: typeof DashboardClientsIdRouteImport
       parentRoute: typeof DashboardClientsRoute
+    }
+    '/api/public/relays': {
+      id: '/api/public/relays'
+      path: '/api/public/relays'
+      fullPath: '/api/public/relays'
+      preLoaderRoute: typeof ApiPublicRelaysRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/api/public/nowpayments/webhook': {
       id: '/api/public/nowpayments/webhook'
@@ -866,6 +886,7 @@ const rootRouteChildren: RootRouteChildren = {
   StatusRoute: StatusRoute,
   ControlIdRoute: ControlIdRoute,
   ProfileUsernameRoute: ProfileUsernameRoute,
+  ApiPublicRelaysRoute: ApiPublicRelaysRoute,
   ApiPublicAgentAutoRegisterRoute: ApiPublicAgentAutoRegisterRoute,
   ApiPublicAgentCameraRoute: ApiPublicAgentCameraRoute,
   ApiPublicAgentHeartbeatRoute: ApiPublicAgentHeartbeatRoute,

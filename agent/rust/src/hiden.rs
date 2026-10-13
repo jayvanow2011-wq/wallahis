@@ -26,17 +26,21 @@ use tokio_tungstenite::{
 use crate::binding::{HIDEN_AUTH_KEY, HIDEN_WS_URL};
 use crate::signaling::Signal;
 
-/// Connect to the HidenHost relay as `role=agent` for `device_id`.
+/// Connect to the HidenHost relay as `role=agent` for `device_id` at `ws_url`.
 /// Returns `(tx, rx)` matching `signaling::spawn`.
-pub async fn spawn(device_id: String) -> Result<(Sender<Signal>, Receiver<Signal>)> {
+pub async fn spawn_at(
+    ws_url: &str,
+    device_id: String,
+) -> Result<(Sender<Signal>, Receiver<Signal>)> {
     let url = format!(
         "{}/?key={}&role=agent&device={}",
-        HIDEN_WS_URL,
+        ws_url,
         urlencode(HIDEN_AUTH_KEY),
         urlencode(&device_id),
     );
     let req = url.as_str().into_client_request()?;
     let (ws, _resp) = connect_async(req).await?;
+
     let (mut write, mut read) = ws.split();
 
     // Handshake — server also accepts query-string identification but the
@@ -110,6 +114,40 @@ pub async fn spawn(device_id: String) -> Result<(Sender<Signal>, Receiver<Signal
 
     Ok((out_tx, in_rx))
 }
+
+/// Back-compat: connect to the compiled-in relay URL.
+pub async fn spawn(device_id: String) -> Result<(Sender<Signal>, Receiver<Signal>)> {
+    spawn_at(HIDEN_WS_URL, device_id).await
+}
+
+/// Discover relay endpoints from the Lovable site. Falls back to the
+/// compiled-in constant if the discovery call fails.
+pub fn discover_relays() -> Vec<String> {
+    use crate::binding::SENTINEL_SERVER;
+    let url = format!("{}/api/public/relays", SENTINEL_SERVER.trim_end_matches('/'));
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(resp) = ureq::get(&url).timeout(Duration::from_secs(5)).call() {
+        if let Ok(v) = resp.into_json::<Value>() {
+            if let Some(arr) = v.get("relays").and_then(|r| r.as_array()) {
+                let mut items: Vec<(i64, String)> = arr
+                    .iter()
+                    .filter_map(|r| {
+                        let ws = r.get("ws").and_then(|s| s.as_str())?.to_string();
+                        let prio = r.get("priority").and_then(|p| p.as_i64()).unwrap_or(100);
+                        Some((prio, ws))
+                    })
+                    .collect();
+                items.sort_by_key(|(p, _)| *p);
+                out = items.into_iter().map(|(_, u)| u).collect();
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(HIDEN_WS_URL.to_string());
+    }
+    out
+}
+
 
 fn urlencode(s: &str) -> String {
     s.bytes()
