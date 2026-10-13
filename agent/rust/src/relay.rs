@@ -46,13 +46,40 @@ pub fn start(device_id: String) -> StdReceiver<InboundCmd> {
     OUT_TX.get_or_init(|| Mutex::new(None));
 
     runtime().spawn(async move {
+        let mut idx: usize = 0;
+        let mut relays: Vec<String> = Vec::new();
+        let mut last_refresh = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(3600))
+            .unwrap_or_else(std::time::Instant::now);
         loop {
-            match hiden::spawn(device_id.clone()).await {
+            // Refresh relay list every 5 min or when we've exhausted the list.
+            if relays.is_empty() || last_refresh.elapsed() > Duration::from_secs(300) {
+                let device_id_clone = device_id.clone();
+                let fetched = tokio::task::spawn_blocking(move || {
+                    let _ = &device_id_clone;
+                    hiden::discover_relays()
+                })
+                .await
+                .unwrap_or_default();
+                if !fetched.is_empty() {
+                    relays = fetched;
+                    idx = 0;
+                }
+                last_refresh = std::time::Instant::now();
+            }
+            if relays.is_empty() {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+            let url = relays[idx % relays.len()].clone();
+            idx = idx.wrapping_add(1);
+
+            match hiden::spawn_at(&url, device_id.clone()).await {
                 Ok((out_tx, mut in_rx)) => {
                     if let Some(slot) = OUT_TX.get() {
                         *slot.lock().unwrap() = Some(out_tx);
                     }
-                    eprintln!("[relay] connected as agent for {}", device_id);
+                    eprintln!("[relay] connected as agent for {} via {}", device_id, url);
 
                     while let Some(sig) = in_rx.recv().await {
                         let _ = sync_tx.send(InboundCmd {
@@ -67,12 +94,13 @@ pub fn start(device_id: String) -> StdReceiver<InboundCmd> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[relay] connect error: {} — retry in 5s", e);
+                    eprintln!("[relay] connect error on {}: {} — trying next", url, e);
                 }
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
+
 
     sync_rx
 }
